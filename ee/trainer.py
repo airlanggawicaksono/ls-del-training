@@ -1,6 +1,7 @@
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
+import torch
 from transformers import Trainer
 
 from .hub import save_exit_heads
@@ -52,6 +53,19 @@ class EarlyExitTrainer(Trainer):
         """Inject per-exit loss metrics into every log call."""
         logs.update(self._last_ee_metrics)
         super().log(logs, *args, **kwargs)
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only: bool,
+        ignore_keys=None,
+    ) -> Tuple[Optional[torch.Tensor], None, None]:
+        """Override so Trainer never tries to subscript EarlyExitOutput."""
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+        return (loss.detach(), None, None)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
         """Save only exit heads + tokenizer, not the full base model."""
