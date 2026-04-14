@@ -7,3 +7,4 @@ pydantic
 safetensors
 psutil
 nvidia-ml-py
+rouge-score

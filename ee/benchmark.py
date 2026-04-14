@@ -1,5 +1,5 @@
 """
-Full benchmark suite: quality (perplexity/accuracy) + latency + energy.
+Full benchmark suite: quality (perplexity/accuracy/ROUGE) + latency + energy.
 
 Compares early-exit model vs baseline (original LLaMA) on CNN/DailyMail.
 Both models are torch.compiled before benchmarking.
@@ -8,11 +8,12 @@ Both models are torch.compiled before benchmarking.
 import json
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from rouge_score import rouge_scorer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .hub import load_exit_heads, push_benchmark_results_to_hub
@@ -21,17 +22,36 @@ from .model_wrapper import EarlyExitLlamaWrapper
 from .utils import freeze_base_model
 
 
-def load_cnn_dailymail(n_samples: int = 100, max_length: int = 512) -> List[str]:
-    """Load CNN/DailyMail articles as prompts for benchmarking."""
+def load_cnn_dailymail(
+    n_samples: int = 100, max_prompt_length: int = 512,
+) -> List[Dict[str, str]]:
+    """Load CNN/DailyMail articles + reference summaries for benchmarking."""
     ds = load_dataset("cnn_dailymail", "3.0.0", split=f"test[:{n_samples}]")
-    prompts = []
+    samples = []
     for row in ds:
-        # Use the first ~max_length chars of the article as prompt
-        text = row["article"][:max_length]
-        prompts.append(text)
-    return prompts
+        samples.append({
+            "prompt": row["article"][:max_prompt_length],
+            "reference": row["highlights"],
+        })
+    return samples
 
 
+def compute_rouge(predictions: List[str], references: List[str]) -> Dict[str, float]:
+    """Compute ROUGE-2 and ROUGE-L F1 scores."""
+    scorer = rouge_scorer.RougeScorer(["rouge2", "rougeL"], use_stemmer=True)
+    r2_scores = []
+    rl_scores = []
+    for pred, ref in zip(predictions, references):
+        scores = scorer.score(ref, pred)
+        r2_scores.append(scores["rouge2"].fmeasure)
+        rl_scores.append(scores["rougeL"].fmeasure)
+    return {
+        "rouge2_f1": round(sum(r2_scores) / len(r2_scores), 4),
+        "rougeL_f1": round(sum(rl_scores) / len(rl_scores), 4),
+    }
+
+
+@torch.no_grad()
 def _quality_for_exit(
     wrapper: EarlyExitLlamaWrapper,
     exit_layer_idx: int,
@@ -86,11 +106,12 @@ def _quality_for_exit(
 @torch.no_grad()
 def benchmark_quality(
     wrapper: EarlyExitLlamaWrapper,
-    prompts: List[str],
+    samples: List[Dict[str, str]],
     tokenizer,
     max_length: int = 512,
 ) -> Dict[str, Dict[str, float]]:
-    """Quality metrics for each exit + final layer."""
+    """Quality metrics (perplexity/accuracy) for each exit + final layer."""
+    prompts = [s["prompt"] for s in samples]
     results = {}
 
     for idx in wrapper.exit_layer_indices:
@@ -106,15 +127,18 @@ def benchmark_quality(
 
 def benchmark_latency_energy(
     generator,
-    prompts: List[str],
+    samples: List[Dict[str, str]],
     max_new_tokens: int = 128,
     warmup: int = 3,
 ) -> Dict[str, float]:
     """
-    Run generation on prompts, aggregate latency and energy.
+    Run generation on samples, aggregate latency, energy, and ROUGE.
 
     Runs a few warmup prompts first (important after torch.compile).
     """
+    prompts = [s["prompt"] for s in samples]
+    references = [s["reference"] for s in samples]
+
     # Warmup (torch.compile compiles on first few runs)
     for i in range(min(warmup, len(prompts))):
         generator.generate(prompts[i], max_new_tokens=32)
@@ -126,6 +150,7 @@ def benchmark_latency_energy(
     e2e_lats = []
     total_energy = 0.0
     total_tokens = 0
+    predictions = []
 
     for i, prompt in enumerate(prompts):
         result = generator.generate(prompt, max_new_tokens=max_new_tokens)
@@ -134,11 +159,15 @@ def benchmark_latency_energy(
         e2e_lats.append(result["end_to_end_sec"])
         total_energy += result["total_energy_j"]
         total_tokens += result["n_tokens"]
+        predictions.append(result["text"])
 
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(prompts)}] avg TTFT={sum(ttfts)/len(ttfts):.4f}s")
 
     tokens_per_joule = total_tokens / total_energy if total_energy > 0 else 0.0
+
+    # ROUGE scores against reference summaries
+    rouge = compute_rouge(predictions, references)
 
     return {
         "ttft_sec_mean": round(sum(ttfts) / len(ttfts), 6),
@@ -148,6 +177,7 @@ def benchmark_latency_energy(
         "total_tokens": total_tokens,
         "total_energy_j": round(total_energy, 4),
         "tokens_per_joule": round(tokens_per_joule, 2),
+        **rouge,
     }
 
 
@@ -225,15 +255,12 @@ def run_full_benchmark(
     wrapper.cuda()
 
     # ---- torch.compile ----
-    print("\n=== Compiling models with torch.compile ===")
-    print("Compiling full backbone (shared by baseline + EE) and EE heads/runtime...")
-    compiled_base = torch.compile(base_model)
-    compiled_exit_heads = _compile_exit_heads(exit_heads)
-    for idx in exit_layer_indices:
-        wrapper.exit_heads[str(idx)] = torch.compile(wrapper.exit_heads[str(idx)])
-    # Compile base model layers used in EE forward
-    wrapper.base_model = compiled_base
-
+    # Both EE and baseline get fully compiled.
+    #   - EE: compile_runtime=True compiles the entire step fn (embed → layers → exit check)
+    #   - Baseline: torch.compile(model) compiles the whole model for .generate()
+    #   - Quality benchmark runs first BEFORE compile (just perplexity, no speed measurement)
+    print("\n=== Quality Benchmark (perplexity / accuracy) ===")
+    print("  (runs before compile — quality doesn't need speed optimization)")
     results = {
         "config": {
             "base_model": base_model_name,
@@ -244,33 +271,38 @@ def run_full_benchmark(
             "torch_dtype": str(torch_dtype),
         }
     }
+    results["quality"] = benchmark_quality(wrapper, samples, tokenizer)
 
-    # ---- Quality (forward-pass perplexity/accuracy) ----
-    print("\n=== Quality Benchmark (perplexity / accuracy) ===")
-    results["quality"] = benchmark_quality(wrapper, prompts, tokenizer)
-
-    # Print quality table
     print("\n  Model       | Loss   | Perplexity | Accuracy")
     print("  ------------+--------+------------+---------")
     for key, r in results["quality"].items():
         print(f"  {key:11s} | {r['loss']:.4f} | {r['perplexity']:10.2f} | {r['accuracy']:.4f}")
 
-    # ---- Latency + Energy: Early Exit ----
-    print(f"\n=== Latency/Energy: Early Exit (threshold={confidence_threshold}) ===")
+    # Done with wrapper/hooks for quality — clean up before compile
+    wrapper.remove_hooks()
+
+    # ---- Compile everything ----
+    print("\n=== Compiling models with torch.compile ===")
+    compiled_base = torch.compile(base_model)
+    compiled_exit_heads = _compile_exit_heads(exit_heads)
+    print("  Compiled base model + exit heads")
+
+    # ---- Latency + Energy + ROUGE: Early Exit (fully compiled) ----
+    print(f"\n=== Latency/Energy/ROUGE: Early Exit (threshold={confidence_threshold}) ===")
     ee_gen = EarlyExitGenerator(
-        compiled_base,
+        base_model,
         compiled_exit_heads,
         tokenizer,
         confidence_threshold,
-        compile_runtime=True,
+        compile_runtime=True,  # compiles entire EE step fn as one unit
     )
-    results["ee_latency"] = benchmark_latency_energy(ee_gen, prompts, max_new_tokens)
+    results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
 
-    # ---- Latency + Energy: Baseline (full model) ----
-    print("\n=== Latency/Energy: Baseline (full model) ===")
+    # ---- Latency + Energy + ROUGE: Baseline (fully compiled) ----
+    print("\n=== Latency/Energy/ROUGE: Baseline (full model) ===")
     baseline_gen = BaselineGenerator(compiled_base, tokenizer)
-    results["baseline_latency"] = benchmark_latency_energy(baseline_gen, prompts, max_new_tokens)
+    results["baseline_latency"] = benchmark_latency_energy(baseline_gen, samples, max_new_tokens)
 
     # ---- Comparison summary ----
     ee = results["ee_latency"]
@@ -281,19 +313,21 @@ def run_full_benchmark(
     print(f"{'Metric':<30s} {'Baseline':>12s} {'Early Exit':>12s} {'Speedup':>10s}")
     print("-" * 64)
 
-    for key, label in [
-        ("ttft_sec_mean", "TTFT (sec)"),
-        ("per_token_latency_sec_mean", "Per-token lat (sec)"),
-        ("end_to_end_sec_mean", "End-to-end (sec)"),
-        ("tokens_per_joule", "Tokens/Joule"),
+    for key, label, higher_is_better in [
+        ("ttft_sec_mean", "TTFT (sec)", False),
+        ("per_token_latency_sec_mean", "Per-token lat (sec)", False),
+        ("end_to_end_sec_mean", "End-to-end (sec)", False),
+        ("tokens_per_joule", "Tokens/Joule", True),
+        ("rouge2_f1", "ROUGE-2 F1", True),
+        ("rougeL_f1", "ROUGE-L F1", True),
     ]:
         bv = bl[key]
         ev = ee[key]
-        if key == "tokens_per_joule":
-            speedup = f"{ev/bv:.2f}x" if bv > 0 else "N/A"
+        if higher_is_better:
+            ratio = f"{ev/bv:.2f}x" if bv > 0 else "N/A"
         else:
-            speedup = f"{bv/ev:.2f}x" if ev > 0 else "N/A"
-        print(f"  {label:<28s} {bv:>12.4f} {ev:>12.4f} {speedup:>10s}")
+            ratio = f"{bv/ev:.2f}x" if ev > 0 else "N/A"
+        print(f"  {label:<28s} {bv:>12.4f} {ev:>12.4f} {ratio:>10s}")
 
     print("=" * 60)
 
@@ -314,5 +348,4 @@ def run_full_benchmark(
         )
         print(f"Results pushed to Hub: {results_url}")
 
-    wrapper.remove_hooks()
     return results

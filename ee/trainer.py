@@ -48,10 +48,10 @@ class EarlyExitTrainer(Trainer):
             return loss, outputs
         return loss
 
-    def log(self, logs: Dict[str, float], **kwargs) -> None:
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         """Inject per-exit loss metrics into every log call."""
         logs.update(self._last_ee_metrics)
-        super().log(logs, **kwargs)
+        super().log(logs, *args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
         """Save only exit heads + tokenizer, not the full base model."""
@@ -61,6 +61,7 @@ class EarlyExitTrainer(Trainer):
         # Save exit head weights
         save_exit_heads(self.model, output_dir)
 
-        # Save tokenizer
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
+        # Save tokenizer (processing_class in newer transformers, tokenizer in older)
+        tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
+        if tok is not None:
+            tok.save_pretrained(output_dir)

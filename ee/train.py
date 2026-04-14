@@ -89,13 +89,9 @@ def run_ee_training(
     # ---- Dataset ----
     raw_dataset = _load_raw_dataset(cfg)
 
-    # Subset if max_train_samples / max_val_samples set
-    if cfg.max_train_samples and len(raw_dataset["train"]) > cfg.max_train_samples:
-        raw_dataset["train"] = raw_dataset["train"].select(range(cfg.max_train_samples))
-        print(f"[EE] Subsetted train to {cfg.max_train_samples:,} samples")
-    if cfg.max_val_samples and "validation" in raw_dataset and len(raw_dataset["validation"]) > cfg.max_val_samples:
-        raw_dataset["validation"] = raw_dataset["validation"].select(range(cfg.max_val_samples))
-        print(f"[EE] Subsetted validation to {cfg.max_val_samples:,} samples")
+    print(f"[EE] Train samples: {len(raw_dataset['train']):,}")
+    if "validation" in raw_dataset:
+        print(f"[EE] Validation samples: {len(raw_dataset['validation']):,}")
 
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model_name_or_path,

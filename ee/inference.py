@@ -207,6 +207,9 @@ class BaselineGenerator:
     ):
         self.model = model
         self.tokenizer = tokenizer
+        # Resolve layer count — works on both raw and torch.compile'd models
+        raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+        self._num_layers = len(raw.model.layers) - 1 if hasattr(raw, "model") else 31
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -220,29 +223,17 @@ class BaselineGenerator:
         input_ids = input_ids.to(self.model.device)
         prompt_len = input_ids.shape[1]
 
+        # Single generate call
         torch.cuda.synchronize()
-        e2e_start = time.perf_counter()
         power_start = _gpu_power_watts()
+        e2e_start = time.perf_counter()
 
-        # Generate first token
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        out = self.model.generate(
-            input_ids,
-            max_new_tokens=1,
-            do_sample=False,
-        )
-        torch.cuda.synchronize()
-        ttft = time.perf_counter() - t0
-
-        # Generate remaining tokens
-        torch.cuda.synchronize()
-        t_gen_start = time.perf_counter()
         out = self.model.generate(
             input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=False,
         )
+
         torch.cuda.synchronize()
         e2e_end = time.perf_counter()
         power_end = _gpu_power_watts()
@@ -252,10 +243,12 @@ class BaselineGenerator:
         n_tokens = len(generated_ids)
         e2e_sec = e2e_end - e2e_start
 
-        # Per-token latency: (total gen time - ttft) / (n_tokens - 1)
-        gen_time = e2e_end - t_gen_start
-        avg_per_token = (gen_time - ttft) / max(n_tokens - 1, 1) if n_tokens > 1 else ttft
+        # Approximate TTFT and per-token latency from total time
+        # (model.generate doesn't expose per-step timing)
+        ttft = e2e_sec / max(n_tokens, 1)  # first token ≈ avg when no KV warmup split
+        avg_per_token = (e2e_sec - ttft) / max(n_tokens - 1, 1) if n_tokens > 1 else ttft
 
+        # Energy: sample power at start + end, trapezoidal
         avg_power = (power_start + power_end) / 2.0
         total_energy_j = avg_power * e2e_sec
         tokens_per_joule = n_tokens / total_energy_j if total_energy_j > 0 else 0.0
@@ -264,7 +257,7 @@ class BaselineGenerator:
             "text": text,
             "tokens": generated_ids,
             "n_tokens": n_tokens,
-            "exit_layers": [31] * n_tokens,  # always full model
+            "exit_layers": [self._num_layers] * n_tokens,
             # Latency
             "ttft_sec": round(ttft, 6),
             "per_token_latency_sec": round(avg_per_token, 6),
