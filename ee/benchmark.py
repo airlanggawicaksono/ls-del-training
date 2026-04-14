@@ -215,7 +215,7 @@ def run_full_benchmark(
       8. Optional: push JSON results to HF Hub
     """
     print(f"=== Loading CNN/DailyMail ({n_samples} samples) ===")
-    prompts = load_cnn_dailymail(n_samples)
+    samples = load_cnn_dailymail(n_samples)
 
     # ---- Load models ----
     print(f"\n=== Loading base model: {base_model_name} ===")

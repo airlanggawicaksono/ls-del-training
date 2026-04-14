@@ -28,7 +28,7 @@ class EarlyExitTrainer(Trainer):
         self._last_ee_metrics: Dict[str, float] = {}
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.pop("labels")
+        labels = inputs["labels"]
 
         outputs = model(
             input_ids=inputs["input_ids"],
