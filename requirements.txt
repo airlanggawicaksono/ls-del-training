@@ -1,0 +1,9 @@
+huggingface_hub[cli]
+transformers
+datasets
+accelerate
+torch
+pydantic
+safetensors
+psutil
+pynvml

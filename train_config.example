@@ -1,0 +1,25 @@
+# LLaMA decoder-only trainer config (key = value)
+# Required: dataset_name OR train_file
+
+model_name_or_path = meta-llama/Meta-Llama-3-8B
+train_file = data/train.jsonl
+validation_file = data/valid.jsonl
+text_column = text
+output_dir = outputs/llama
+
+max_seq_length = 2048
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 16
+learning_rate = 2e-5
+num_train_epochs = 3
+
+logging_steps = 10
+save_steps = 250
+eval_steps = 250
+seed = 42
+
+gradient_checkpointing = true
+torch_dtype = bfloat16
+padding_side = right
+report_to = [none]

@@ -1,0 +1,37 @@
+# Early-Exit Tuning config for LLaMA-3-8B
+# Usage: python finetune_ee.py --config ee_train_config.example
+
+model_name_or_path = meta-llama/Meta-Llama-3-8B
+
+# --- Dataset: C4 English subset (~300M tokens) ---
+dataset_name = allenai/c4
+dataset_config_name = en
+text_column = text
+max_train_samples = 1200000
+max_val_samples = 5000
+
+output_dir = outputs/llama-ee
+
+max_seq_length = 2048
+per_device_train_batch_size = 1
+per_device_eval_batch_size = 1
+gradient_accumulation_steps = 16
+learning_rate = 1e-4
+num_train_epochs = 1
+
+logging_steps = 10
+save_steps = 500
+eval_steps = 500
+seed = 42
+
+torch_dtype = bfloat16
+padding_side = right
+report_to = [none]
+overwrite_output_dir = true
+
+# --- Early-exit specific ---
+exit_layer_indices = [8, 16, 24]
+exit_loss_weights = [1.0, 1.0, 1.0]
+init_exit_from_base = true
+exit_confidence_threshold = 0.9
+# hub_exit_heads_repo = your-username/llama3-8b-ee-heads
