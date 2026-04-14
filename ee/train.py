@@ -9,12 +9,16 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
-    TrainingArguments,
     set_seed,
 )
 
 from config_types_ee import EETrainConfig
-from trainer_utils import _load_raw_dataset, _resolve_dtype
+from trainer_utils import (
+    _build_training_arguments,
+    _load_raw_dataset,
+    _resolve_dtype,
+    _trainer_tokenizer_kwargs,
+)
 
 from .callbacks import TrainingMetricsCallback
 from .hub import push_exit_heads_to_hub, push_training_logs_to_hub, save_exit_heads
@@ -141,36 +145,39 @@ def run_ee_training(
         zip(cfg.exit_layer_indices, cfg.exit_loss_weights)
     )
 
-    training_args = TrainingArguments(
-        output_dir=cfg.output_dir,
-        overwrite_output_dir=cfg.overwrite_output_dir,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.per_device_eval_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        learning_rate=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        num_train_epochs=cfg.num_train_epochs,
-        logging_steps=cfg.logging_steps,
-        save_steps=cfg.save_steps,
-        eval_steps=cfg.eval_steps,
-        save_total_limit=cfg.save_total_limit,
-        gradient_checkpointing=False,  # no benefit when backbone frozen
-        report_to=cfg.report_to_list,
-        eval_strategy="steps",
-        load_best_model_at_end=False,  # we track per-exit, not single metric
-        push_to_hub=False,  # we handle hub upload separately
+    training_args = _build_training_arguments(
+        {
+            "output_dir": cfg.output_dir,
+            "overwrite_output_dir": cfg.overwrite_output_dir,
+            "per_device_train_batch_size": cfg.per_device_train_batch_size,
+            "per_device_eval_batch_size": cfg.per_device_eval_batch_size,
+            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+            "learning_rate": cfg.learning_rate,
+            "weight_decay": cfg.weight_decay,
+            "num_train_epochs": cfg.num_train_epochs,
+            "logging_steps": cfg.logging_steps,
+            "save_steps": cfg.save_steps,
+            "eval_steps": cfg.eval_steps,
+            "save_total_limit": cfg.save_total_limit,
+            "gradient_checkpointing": False,  # no benefit when backbone frozen
+            "report_to": cfg.report_to_list,
+            "evaluation_strategy": "steps",
+            "load_best_model_at_end": False,  # we track per-exit, not single metric
+            "push_to_hub": False,  # we handle hub upload separately
+        }
     )
 
-    trainer = EarlyExitTrainer(
-        exit_weights=exit_weights,
-        model=wrapper,
-        args=training_args,
-        train_dataset=lm_dataset["train"],
-        eval_dataset=lm_dataset["validation"],
-        processing_class=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-        callbacks=[TrainingMetricsCallback(seq_length=cfg.max_seq_length)],
-    )
+    trainer_kwargs: Dict[str, object] = {
+        "exit_weights": exit_weights,
+        "model": wrapper,
+        "args": training_args,
+        "train_dataset": lm_dataset["train"],
+        "eval_dataset": lm_dataset["validation"],
+        "data_collator": DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        "callbacks": [TrainingMetricsCallback(seq_length=cfg.max_seq_length)],
+    }
+    trainer_kwargs.update(_trainer_tokenizer_kwargs(tokenizer))
+    trainer = EarlyExitTrainer(**trainer_kwargs)
 
     train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     final_eval_metrics = trainer.evaluate()

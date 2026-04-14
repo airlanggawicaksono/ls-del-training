@@ -1,3 +1,4 @@
+import inspect
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -13,6 +14,42 @@ from transformers import (
 )
 
 from config_types import TrainConfig
+
+
+def _build_training_arguments(kwargs: Dict[str, Any]) -> TrainingArguments:
+    """
+    Build TrainingArguments across transformers versions by:
+      - Mapping eval strategy aliases (evaluation_strategy <-> eval_strategy)
+      - Dropping unsupported kwargs based on runtime signature
+    """
+    params = inspect.signature(TrainingArguments.__init__).parameters
+    normalized = dict(kwargs)
+
+    if "eval_strategy" in params:
+        if "evaluation_strategy" in normalized and "eval_strategy" not in normalized:
+            normalized["eval_strategy"] = normalized.pop("evaluation_strategy")
+    elif "evaluation_strategy" in params:
+        if "eval_strategy" in normalized and "evaluation_strategy" not in normalized:
+            normalized["evaluation_strategy"] = normalized.pop("eval_strategy")
+    else:
+        normalized.pop("eval_strategy", None)
+        normalized.pop("evaluation_strategy", None)
+
+    filtered = {k: v for k, v in normalized.items() if k in params}
+    return TrainingArguments(**filtered)
+
+
+def _trainer_tokenizer_kwargs(tokenizer) -> Dict[str, Any]:
+    """
+    Return the right tokenizer-like kwarg for Trainer across versions.
+    Newer versions may use processing_class; older versions use tokenizer.
+    """
+    params = inspect.signature(Trainer.__init__).parameters
+    if "processing_class" in params:
+        return {"processing_class": tokenizer}
+    if "tokenizer" in params:
+        return {"tokenizer": tokenizer}
+    return {}
 
 
 def _parse_scalar(raw: str) -> Any:
@@ -93,7 +130,41 @@ def _dataset_extension(path: str) -> str:
 
 def _load_raw_dataset(cfg: TrainConfig) -> DatasetDict:
     if cfg.dataset_name:
-        dataset = load_dataset(cfg.dataset_name, cfg.dataset_config_name)
+        # For configs that define max sample caps (e.g., EETrainConfig), load
+        # split slices directly to avoid materializing huge full datasets first.
+        max_train_samples = getattr(cfg, "max_train_samples", None)
+        max_val_samples = getattr(cfg, "max_val_samples", None)
+
+        if max_train_samples or max_val_samples:
+            train_split = (
+                f"train[:{int(max_train_samples)}]" if max_train_samples else "train"
+            )
+            validation_split = (
+                f"validation[:{int(max_val_samples)}]"
+                if max_val_samples
+                else "validation"
+            )
+
+            train_ds = load_dataset(
+                cfg.dataset_name,
+                cfg.dataset_config_name,
+                split=train_split,
+            )
+            try:
+                val_ds = load_dataset(
+                    cfg.dataset_name,
+                    cfg.dataset_config_name,
+                    split=validation_split,
+                )
+            except Exception:
+                val_ds = None
+
+            if val_ds is not None:
+                dataset = DatasetDict({"train": train_ds, "validation": val_ds})
+            else:
+                dataset = DatasetDict({"train": train_ds})
+        else:
+            dataset = load_dataset(cfg.dataset_name, cfg.dataset_config_name)
     else:
         data_files: Dict[str, str] = {"train": cfg.train_file}
         if cfg.validation_file:
@@ -165,37 +236,40 @@ def run_training(cfg: TrainConfig, resume_from_checkpoint: Optional[str] = None)
 
     lm_dataset = tokenized.map(group_texts, batched=True, desc="Packing")
 
-    training_args = TrainingArguments(
-        output_dir=cfg.output_dir,
-        overwrite_output_dir=cfg.overwrite_output_dir,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.per_device_eval_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        learning_rate=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        num_train_epochs=cfg.num_train_epochs,
-        logging_steps=cfg.logging_steps,
-        save_steps=cfg.save_steps,
-        eval_steps=cfg.eval_steps,
-        save_total_limit=cfg.save_total_limit,
-        gradient_checkpointing=cfg.gradient_checkpointing,
-        report_to=cfg.report_to_list,
-        evaluation_strategy="steps",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        push_to_hub=cfg.push_to_hub,
-        hub_model_id=cfg.hub_model_id,
+    training_args = _build_training_arguments(
+        {
+            "output_dir": cfg.output_dir,
+            "overwrite_output_dir": cfg.overwrite_output_dir,
+            "per_device_train_batch_size": cfg.per_device_train_batch_size,
+            "per_device_eval_batch_size": cfg.per_device_eval_batch_size,
+            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+            "learning_rate": cfg.learning_rate,
+            "weight_decay": cfg.weight_decay,
+            "num_train_epochs": cfg.num_train_epochs,
+            "logging_steps": cfg.logging_steps,
+            "save_steps": cfg.save_steps,
+            "eval_steps": cfg.eval_steps,
+            "save_total_limit": cfg.save_total_limit,
+            "gradient_checkpointing": cfg.gradient_checkpointing,
+            "report_to": cfg.report_to_list,
+            "evaluation_strategy": "steps",
+            "load_best_model_at_end": True,
+            "metric_for_best_model": "eval_loss",
+            "greater_is_better": False,
+            "push_to_hub": cfg.push_to_hub,
+            "hub_model_id": cfg.hub_model_id,
+        }
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=lm_dataset["train"],
-        eval_dataset=lm_dataset["validation"],
-        tokenizer=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-    )
+    trainer_kwargs: Dict[str, Any] = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": lm_dataset["train"],
+        "eval_dataset": lm_dataset["validation"],
+        "data_collator": DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+    }
+    trainer_kwargs.update(_trainer_tokenizer_kwargs(tokenizer))
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     trainer.save_model(cfg.output_dir)
