@@ -63,7 +63,15 @@ def _parse_config_file(config_path: str) -> Dict[str, Any]:
             if "=" not in stripped:
                 raise ValueError(f"Invalid config line {line_no}: expected key = value")
             key, raw_value = stripped.split("=", 1)
-            parsed[key.strip()] = _parse_value(raw_value)
+            parsed_key = key.strip()
+            parsed_value = _parse_value(raw_value)
+
+            # Keep report_to entries as strings (e.g. [none] -> ["none"])
+            # so Pydantic validation for List[str] does not fail.
+            if parsed_key == "report_to" and isinstance(parsed_value, list):
+                parsed_value = ["none" if v is None else str(v) for v in parsed_value]
+
+            parsed[parsed_key] = parsed_value
     return parsed
 
 

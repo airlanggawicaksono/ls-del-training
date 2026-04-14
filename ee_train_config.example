@@ -26,7 +26,7 @@ seed = 42
 
 torch_dtype = bfloat16
 padding_side = right
-report_to = [none]
+report_to = ["none"]
 overwrite_output_dir = true
 
 # --- Early-exit specific ---

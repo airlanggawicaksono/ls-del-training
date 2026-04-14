@@ -6,4 +6,4 @@ torch
 pydantic
 safetensors
 psutil
-pynvml
+nvidia-ml-py
