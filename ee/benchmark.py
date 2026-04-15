@@ -182,10 +182,15 @@ def benchmark_latency_energy(
 
 
 def _compile_exit_heads(exit_heads: Dict[int, torch.nn.Module]) -> Dict[int, torch.nn.Module]:
-    """Compile each exit head so EE latency is measured with compiled heads."""
+    """Compile each exit head so EE latency is measured with compiled heads.
+
+    dynamic=True because each token step has a different seq_len (no KV
+    cache). Without this, torch.compile recompiles for every shape and
+    benchmark takes forever.
+    """
     compiled: Dict[int, torch.nn.Module] = {}
     for idx, head in exit_heads.items():
-        compiled[idx] = torch.compile(head)
+        compiled[idx] = torch.compile(head, dynamic=True)
     return compiled
 
 
@@ -281,27 +286,40 @@ def run_full_benchmark(
     # Done with wrapper/hooks for quality — clean up before compile
     wrapper.remove_hooks()
 
-    # ---- Compile everything ----
-    print("\n=== Compiling models with torch.compile ===")
-    compiled_base = torch.compile(base_model)
+    # ---- Compile per-layer (NOT the whole model) ----
+    # We compile each decoder layer and each exit head with dynamic=True.
+    # Both EE and baseline benefit: baseline's generate() calls layers which
+    # are compiled; EE's manual loop calls the same compiled layers + compiled
+    # exit heads. Fair comparison — same components compiled on both paths.
+    #
+    # Why NOT torch.compile(base_model)?
+    #   - Nested with per-layer compile causes tracing conflicts
+    #   - Per-layer compile already covers all heavy matmuls
+    # Why dynamic=True?
+    #   - Each token step has a different seq_len (no KV cache). Without
+    #     dynamic shapes, torch.compile recompiles on every shape (1..128)
+    #     and the benchmark takes forever.
+    print("\n=== Compiling decoder layers + exit heads (dynamic shapes) ===")
+    for i, layer in enumerate(base_model.model.layers):
+        base_model.model.layers[i] = torch.compile(layer, dynamic=True)
     compiled_exit_heads = _compile_exit_heads(exit_heads)
-    print("  Compiled base model + exit heads")
+    print(f"  Compiled {len(base_model.model.layers)} decoder layers + {len(compiled_exit_heads)} exit heads")
 
-    # ---- Latency + Energy + ROUGE: Early Exit (fully compiled) ----
+    # ---- Latency + Energy + ROUGE: Early Exit ----
     print(f"\n=== Latency/Energy/ROUGE: Early Exit (threshold={confidence_threshold}) ===")
     ee_gen = EarlyExitGenerator(
         base_model,
         compiled_exit_heads,
         tokenizer,
         confidence_threshold,
-        compile_runtime=True,  # compiles entire EE step fn as one unit
+        compile_runtime=False,  # step fn is eager; its heavy components are compiled
     )
     results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
 
-    # ---- Latency + Energy + ROUGE: Baseline (fully compiled) ----
+    # ---- Latency + Energy + ROUGE: Baseline ----
     print("\n=== Latency/Energy/ROUGE: Baseline (full model) ===")
-    baseline_gen = BaselineGenerator(compiled_base, tokenizer)
+    baseline_gen = BaselineGenerator(base_model, tokenizer)
     results["baseline_latency"] = benchmark_latency_energy(baseline_gen, samples, max_new_tokens)
 
     # ---- Comparison summary ----
