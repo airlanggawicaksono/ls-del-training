@@ -22,7 +22,7 @@ _orig_apply_rotary = _llama_mod.apply_rotary_pos_emb
 def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos[..., :q.shape[-1]]
     sin = sin[..., :q.shape[-1]]
-    return _orig_apply_rotary(q, k, cos, sin, position_ids)
+    return _orig_apply_rotary(q, k, cos, sin)
 
 _llama_mod.apply_rotary_pos_emb = _apply_rotary_pos_emb_patched
 
