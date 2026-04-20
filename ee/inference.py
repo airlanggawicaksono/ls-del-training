@@ -81,7 +81,9 @@ class EarlyExitGenerator:
                 position_embeddings=position_embeddings,
                 cache_position=cache_position,
             )
-            hidden_states = layer_out[0]
+            hidden_states = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
 
             if layer_idx in self.exit_heads:
                 head = self.exit_heads[layer_idx]
@@ -119,6 +121,7 @@ class EarlyExitGenerator:
         exit_layers: List[int] = []
         confidences: List[float] = []
         per_token_times: List[float] = []
+        call_exit_counts: Dict[int, int] = defaultdict(int)
 
         torch.cuda.synchronize()
         e2e_start = time.perf_counter()
@@ -145,6 +148,7 @@ class EarlyExitGenerator:
             generated_tokens.append(token_id)
             exit_layers.append(exit_layer)
             confidences.append(conf)
+            call_exit_counts[exit_layer] += 1
             self.exit_counts[exit_layer] += 1
             self.total_tokens += 1
 
@@ -173,7 +177,7 @@ class EarlyExitGenerator:
             "n_tokens": n_tokens,
             "exit_layers": exit_layers,
             "confidences": confidences,
-            "exit_stats": dict(self.exit_counts),
+            "exit_stats": dict(call_exit_counts),
             # Latency
             "ttft_sec": round(ttft, 6),
             "per_token_latency_sec": round(avg_per_token, 6),
