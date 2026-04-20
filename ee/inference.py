@@ -70,6 +70,7 @@ class EarlyExitGenerator:
         hidden_states = self.base_model.model.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        cache_position = torch.arange(seq_len, device=device)
 
         position_embeddings = self.base_model.model.rotary_emb(hidden_states, position_ids)
 
@@ -78,6 +79,7 @@ class EarlyExitGenerator:
                 hidden_states,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
+                cache_position=cache_position,
             )
             hidden_states = layer_out[0]
 

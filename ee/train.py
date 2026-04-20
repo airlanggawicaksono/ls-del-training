@@ -170,8 +170,9 @@ def run_ee_training(
         "train_dataset": lm_dataset["train"],
         "eval_dataset": lm_dataset["validation"],
         "data_collator": DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-        "callbacks": [TrainingMetricsCallback(seq_length=cfg.max_seq_length)],
     }
+    metrics_cb = TrainingMetricsCallback(seq_length=cfg.max_seq_length)
+    trainer_kwargs["callbacks"] = [metrics_cb]
     trainer_kwargs.update(_trainer_tokenizer_kwargs(tokenizer))
     trainer = EarlyExitTrainer(**trainer_kwargs)
 
@@ -194,6 +195,8 @@ def run_ee_training(
         json.dump(final_eval_metrics, f, indent=2, default=_json_default)
     with open(os.path.join(logs_dir, "log_history.json"), "w", encoding="utf-8") as f:
         json.dump(trainer.state.log_history, f, indent=2, default=_json_default)
+    with open(os.path.join(logs_dir, "epoch_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics_cb.epoch_metrics, f, indent=2, default=_json_default)
     print(f"[EE] Training logs saved to: {logs_dir}")
 
     # ---- Save ----
