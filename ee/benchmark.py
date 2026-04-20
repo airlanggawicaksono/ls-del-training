@@ -21,8 +21,9 @@ TORCHDYNAMO_VERBOSE = 1
 
 
 def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos[..., : q.shape[-1]]
-    sin = sin[..., : q.shape[-1]]
+    print(f"[RoPE] q={q.shape} k={k.shape} cos={cos.shape} sin={sin.shape}")
+    cos = cos[..., :q.shape[-1]]
+    sin = sin[..., :q.shape[-1]]
     return _orig_apply_rotary(q, k, cos, sin)
 
 
