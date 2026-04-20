@@ -9,7 +9,6 @@ import json
 import math
 import os
 from typing import Dict, List, Optional, Tuple
-
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -18,11 +17,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import transformers.models.llama.modeling_llama as _llama_mod
 
 _orig_apply_rotary = _llama_mod.apply_rotary_pos_emb
+TORCHDYNAMO_VERBOSE = 1
+
 
 def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos[..., :q.shape[-1]]
-    sin = sin[..., :q.shape[-1]]
+    cos = cos[..., : q.shape[-1]]
+    sin = sin[..., : q.shape[-1]]
     return _orig_apply_rotary(q, k, cos, sin)
+
 
 _llama_mod.apply_rotary_pos_emb = _apply_rotary_pos_emb_patched
 
@@ -33,16 +35,19 @@ from .utils import freeze_base_model
 
 
 def load_cnn_dailymail(
-    n_samples: int = 100, max_prompt_length: int = 512,
+    n_samples: int = 100,
+    max_prompt_length: int = 512,
 ) -> List[Dict[str, str]]:
     """Load CNN/DailyMail articles + reference summaries for benchmarking."""
     ds = load_dataset("cnn_dailymail", "3.0.0", split=f"test[:{n_samples}]")
     samples = []
     for row in ds:
-        samples.append({
-            "prompt": row["article"][:max_prompt_length],
-            "reference": row["highlights"],
-        })
+        samples.append(
+            {
+                "prompt": row["article"][:max_prompt_length],
+                "reference": row["highlights"],
+            }
+        )
     return samples
 
 
@@ -238,9 +243,7 @@ def run_full_benchmark(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=torch_dtype, device_map="auto"
-    )
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch_dtype, device_map="auto")
     base_model.config.pad_token_id = tokenizer.pad_token_id
     freeze_base_model(base_model)
 
@@ -251,6 +254,7 @@ def run_full_benchmark(
         heads_dir = exit_heads_repo_or_dir
     else:
         from huggingface_hub import snapshot_download
+
         heads_dir = snapshot_download(exit_heads_repo_or_dir)
 
     head_device = "cuda" if torch.cuda.is_available() else "cpu"
