@@ -15,6 +15,16 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from rouge_score import rouge_scorer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import transformers.models.llama.modeling_llama as _llama_mod
+
+_orig_apply_rotary = _llama_mod.apply_rotary_pos_emb
+
+def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos[..., :q.shape[-1]]
+    sin = sin[..., :q.shape[-1]]
+    return _orig_apply_rotary(q, k, cos, sin, position_ids, unsqueeze_dim)
+
+_llama_mod.apply_rotary_pos_emb = _apply_rotary_pos_emb_patched
 
 from .hub import load_exit_heads, push_benchmark_results_to_hub
 from .inference import BaselineGenerator, EarlyExitGenerator
