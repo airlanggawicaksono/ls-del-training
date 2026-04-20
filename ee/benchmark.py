@@ -319,14 +319,31 @@ def run_full_benchmark(
     compiled_exit_heads = _compile_exit_heads(exit_heads)
     print(f"  Compiled {len(base_model.model.layers)} MLP layers + {len(compiled_exit_heads)} exit heads")
 
-    # ---- Latency + Energy + ROUGE: Early Exit ----
-    print(f"\n=== Latency/Energy/ROUGE: Early Exit (threshold={confidence_threshold}) ===")
+    # ---- Latency + Energy + ROUGE: per exit layer (forced) ----
+    # Each run forces ALL tokens to exit at a specific layer (threshold=0.0).
+    # This is the real comparison: layer 8 vs 16 vs 24 vs full model.
+    results["per_exit_latency"] = {}
+    for layer_idx in exit_layer_indices:
+        print(f"\n=== Latency/Energy/ROUGE: Forced exit at layer {layer_idx} ===")
+        gen = EarlyExitGenerator(
+            base_model,
+            {layer_idx: compiled_exit_heads[layer_idx]},
+            tokenizer,
+            confidence_threshold=0.0,  # always exit here
+            use_kv_cache=True,
+        )
+        results["per_exit_latency"][f"exit_{layer_idx}"] = benchmark_latency_energy(
+            gen, samples, max_new_tokens
+        )
+
+    # ---- Latency + Energy + ROUGE: dynamic confidence exit ----
+    print(f"\n=== Latency/Energy/ROUGE: Dynamic EE (threshold={confidence_threshold}) ===")
     ee_gen = EarlyExitGenerator(
         base_model,
         compiled_exit_heads,
         tokenizer,
         confidence_threshold,
-        compile_runtime=True,
+        use_kv_cache=True,
     )
     results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
@@ -337,31 +354,41 @@ def run_full_benchmark(
     results["baseline_latency"] = benchmark_latency_energy(baseline_gen, samples, max_new_tokens)
 
     # ---- Comparison summary ----
-    ee = results["ee_latency"]
     bl = results["baseline_latency"]
-    print("\n" + "=" * 60)
-    print("COMPARISON SUMMARY")
-    print("=" * 60)
-    print(f"{'Metric':<30s} {'Baseline':>12s} {'Early Exit':>12s} {'Speedup':>10s}")
-    print("-" * 64)
+    print("\n" + "=" * 72)
+    print("COMPARISON SUMMARY (per exit layer vs baseline)")
+    print("=" * 72)
 
-    for key, label, higher_is_better in [
-        ("ttft_sec_mean", "TTFT (sec)", False),
-        ("per_token_latency_sec_mean", "Per-token lat (sec)", False),
-        ("end_to_end_sec_mean", "End-to-end (sec)", False),
-        ("tokens_per_joule", "Tokens/Joule", True),
-        ("rouge2_f1", "ROUGE-2 F1", True),
-        ("rougeL_f1", "ROUGE-L F1", True),
-    ]:
-        bv = bl[key]
-        ev = ee[key]
-        if higher_is_better:
-            ratio = f"{ev/bv:.2f}x" if bv > 0 else "N/A"
-        else:
-            ratio = f"{bv/ev:.2f}x" if ev > 0 else "N/A"
-        print(f"  {label:<28s} {bv:>12.4f} {ev:>12.4f} {ratio:>10s}")
+    col_keys = [
+        ("ttft_sec_mean",             "TTFT (s)",          False),
+        ("per_token_latency_sec_mean","Per-tok lat (s)",   False),
+        ("end_to_end_sec_mean",       "E2E (s)",           False),
+        ("tokens_per_joule",          "Tok/J",             True),
+        ("rouge2_f1",                 "R-2 F1",            True),
+        ("rougeL_f1",                 "R-L F1",            True),
+    ]
 
-    print("=" * 60)
+    header = f"  {'Layer':<10s}" + "".join(f" {lbl:>14s}" for _, lbl, _ in col_keys)
+    print(header)
+    print("  " + "-" * (10 + 14 * len(col_keys)))
+
+    def _row(label, row):
+        parts = [f"  {label:<10s}"]
+        for key, _, higher in col_keys:
+            bv = bl[key]
+            rv = row[key]
+            ratio = ""
+            if bv > 0:
+                ratio = f"{rv/bv:.2f}x" if higher else f"{bv/rv:.2f}x"
+            parts.append(f" {rv:>8.4f}{ratio:>6s}")
+        print("".join(parts))
+
+    _row("baseline", bl)
+    for layer_idx in exit_layer_indices:
+        _row(f"exit_{layer_idx}", results["per_exit_latency"][f"exit_{layer_idx}"])
+    _row("dynamic_ee", results["ee_latency"])
+
+    print("=" * 72)
 
     # ---- Save ----
     if output_path is None:

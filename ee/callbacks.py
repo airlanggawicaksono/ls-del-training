@@ -15,6 +15,25 @@ except Exception:
     pass
 
 
+def _device_caps() -> Dict:
+    """Static device capacity — total VRAM, power limit, CPU count, RAM."""
+    caps: Dict = {}
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        caps["gpu_name"] = props.name
+        caps["gpu_vram_total_gb"] = round(props.total_memory / (1024 ** 3), 2)
+    if _nvml_available:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            caps["gpu_power_limit_w"] = round(pynvml.nvmlDeviceGetPowerManagementLimit(handle) / 1000.0, 1)
+        except Exception:
+            pass
+    caps["cpu_count_physical"] = psutil.cpu_count(logical=False)
+    caps["cpu_count_logical"] = psutil.cpu_count(logical=True)
+    caps["ram_total_gb"] = round(psutil.virtual_memory().total / (1024 ** 3), 2)
+    return caps
+
+
 def _gpu_utilization() -> Dict[str, float]:
     if not _nvml_available:
         return {}
@@ -74,6 +93,7 @@ class TrainingMetricsCallback(TrainerCallback):
 
     def __init__(self, seq_length: int = 2048):
         self.seq_length = seq_length
+        self.device_caps = _device_caps()
         self._step_start: float = 0.0
         self._train_start: float = 0.0
         self._epoch_start: float = 0.0
@@ -213,6 +233,7 @@ class TrainingMetricsCallback(TrainerCallback):
 
         record = {
             "epoch": round(float(state.epoch), 1),
+            "device_caps": self.device_caps,
             "hardware": hardware,
             "exits": exits,
         }
@@ -243,14 +264,23 @@ class TrainingMetricsCallback(TrainerCallback):
         **kwargs,
     ) -> None:
         total_sec = time.perf_counter() - self._train_start
+        caps = self.device_caps
         print("\n--- Training Summary ---")
+        print(f"  GPU:           {caps.get('gpu_name', 'unknown')}")
         print(f"  Total time:    {total_sec / 60:.1f} min")
         print(f"  Total energy:  {self._total_energy_j:.0f} J  |  {self._total_energy_j / 3600:.3f} Wh")
         if torch.cuda.is_available():
-            print(f"  GPU peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
+            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            total_gb = caps.get("gpu_vram_total_gb", "?")
+            print(f"  GPU peak VRAM: {peak_gb:.2f} GB / {total_gb} GB")
         if _nvml_available:
             info = _gpu_utilization()
             if info:
+                limit_w = caps.get("gpu_power_limit_w", "?")
+                print(f"  GPU power now: {info.get('gpu/power_w', '?')} W / {limit_w} W limit")
                 print(f"  GPU temp:      {info.get('gpu/temperature_c', '?')} C")
-        print(f"  CPU RAM (now): {self._process.memory_info().rss / (1024**3):.2f} GB")
+        cpu_gb = self._process.memory_info().rss / (1024 ** 3)
+        ram_total = caps.get("ram_total_gb", "?")
+        print(f"  CPU RAM (now): {cpu_gb:.2f} GB / {ram_total} GB")
+        print(f"  CPU cores:     {caps.get('cpu_count_physical', '?')} physical / {caps.get('cpu_count_logical', '?')} logical")
         print("------------------------\n")
