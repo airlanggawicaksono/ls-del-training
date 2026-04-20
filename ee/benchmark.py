@@ -20,8 +20,14 @@ _orig_apply_rotary = _llama_mod.apply_rotary_pos_emb
 
 
 def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos[..., :q.shape[-1]]
-    sin = sin[..., :q.shape[-1]]
+    rot_dim = cos.shape[-1]
+    head_dim = q.shape[-1]
+    if head_dim != rot_dim:
+        # partial rotation: rotate first rot_dim dims, pass the rest through unchanged
+        q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
+        k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
+        q_embed, k_embed = _orig_apply_rotary(q_rot, k_rot, cos, sin)
+        return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
     return _orig_apply_rotary(q, k, cos, sin)
 
 
@@ -242,7 +248,7 @@ def run_full_benchmark(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch_dtype, device_map="auto")
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch_dtype, device_map="auto", attn_implementation="eager")
     base_model.config.pad_token_id = tokenizer.pad_token_id
     freeze_base_model(base_model)
 
