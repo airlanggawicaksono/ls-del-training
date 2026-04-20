@@ -60,7 +60,7 @@ class EarlyExitGenerator:
         # This makes EE benchmarking more comparable to compiled baseline runs.
         self._step_fn = self._forward_with_early_exit
         if compile_runtime:
-            self._step_fn = torch.compile(self._forward_with_early_exit)
+            self._step_fn = torch.compile(self._forward_with_early_exit, dynamic=True)
 
     def _forward_with_early_exit(
         self,

@@ -17,13 +17,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import transformers.models.llama.modeling_llama as _llama_mod
 
 _orig_apply_rotary = _llama_mod.apply_rotary_pos_emb
-TORCHDYNAMO_VERBOSE = 1
 
 
 def _apply_rotary_pos_emb_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    import traceback
-    print(f"[RoPE] q={q.shape} k={k.shape} cos={cos.shape} sin={sin.shape}")
-    traceback.print_stack(limit=6)
     cos = cos[..., :q.shape[-1]]
     sin = sin[..., :q.shape[-1]]
     return _orig_apply_rotary(q, k, cos, sin)
@@ -303,25 +299,22 @@ def run_full_benchmark(
     # Done with wrapper/hooks for quality — clean up before compile
     wrapper.remove_hooks()
 
-    # ---- Compile per-layer (NOT the whole model) ----
-    # We compile each decoder layer and each exit head with dynamic=True.
-    # Both EE and baseline benefit: baseline's generate() calls layers which
-    # are compiled; EE's manual loop calls the same compiled layers + compiled
-    # exit heads. Fair comparison — same components compiled on both paths.
+    # ---- Compile MLP per-layer + EE forward as one unit ----
+    # Per-layer MLP compile: covers the heavy FFN matmuls for both EE and
+    # baseline. Self-attn is left eager to avoid RoPE symbolic-shape issues
+    # that arise when cos/sin are inputs to a separately compiled self_attn
+    # graph (Dynamo assigns fresh symbolic vars to head_dim and can't unify
+    # them with the static head_dim inside q_proj.view).
     #
-    # Why NOT torch.compile(base_model)?
-    #   - Nested with per-layer compile causes tracing conflicts
-    #   - Per-layer compile already covers all heavy matmuls
-    # Why dynamic=True?
-    #   - Each token step has a different seq_len (no KV cache). Without
-    #     dynamic shapes, torch.compile recompiles on every shape (1..128)
-    #     and the benchmark takes forever.
+    # EE forward is compiled as one unit (compile_runtime=True, dynamic=True).
+    # This puts rotary_emb + q_proj + view + RoPE all in a single Dynamo
+    # trace, so head_dim is a static integer throughout and shapes are
+    # consistent.
     print("\n=== Compiling decoder layers + exit heads (dynamic shapes) ===")
     for layer in base_model.model.layers:
-        layer.self_attn = torch.compile(layer.self_attn, dynamic=True)
         layer.mlp = torch.compile(layer.mlp, dynamic=True)
     compiled_exit_heads = _compile_exit_heads(exit_heads)
-    print(f"  Compiled {len(base_model.model.layers)} decoder layers + {len(compiled_exit_heads)} exit heads")
+    print(f"  Compiled {len(base_model.model.layers)} MLP layers + {len(compiled_exit_heads)} exit heads")
 
     # ---- Latency + Energy + ROUGE: Early Exit ----
     print(f"\n=== Latency/Energy/ROUGE: Early Exit (threshold={confidence_threshold}) ===")
@@ -330,7 +323,7 @@ def run_full_benchmark(
         compiled_exit_heads,
         tokenizer,
         confidence_threshold,
-        compile_runtime=False,  # step fn is eager; its heavy components are compiled
+        compile_runtime=True,  # whole step fn compiled as one unit; avoids RoPE shape issues
     )
     results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
