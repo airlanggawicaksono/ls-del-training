@@ -300,8 +300,9 @@ def run_full_benchmark(
     #     dynamic shapes, torch.compile recompiles on every shape (1..128)
     #     and the benchmark takes forever.
     print("\n=== Compiling decoder layers + exit heads (dynamic shapes) ===")
-    for i, layer in enumerate(base_model.model.layers):
-        base_model.model.layers[i] = torch.compile(layer, dynamic=True)
+    for layer in base_model.model.layers:
+        layer.self_attn = torch.compile(layer.self_attn, dynamic=True)
+        layer.mlp = torch.compile(layer.mlp, dynamic=True)
     compiled_exit_heads = _compile_exit_heads(exit_heads)
     print(f"  Compiled {len(base_model.model.layers)} decoder layers + {len(compiled_exit_heads)} exit heads")
 
