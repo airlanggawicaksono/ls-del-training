@@ -71,10 +71,16 @@ class EarlyExitGenerator:
         seq_len = input_ids.shape[1]
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
+        cos, sin = self.base_model.model.rotary_emb(hidden_states, position_ids)
+        torch._dynamo.mark_static(cos, -1)
+        torch._dynamo.mark_static(sin, -1)
+        position_embeddings = (cos, sin)
+
         for layer_idx, layer in enumerate(self.base_model.model.layers):
             layer_out = layer(
                 hidden_states,
                 position_ids=position_ids,
+                position_embeddings=position_embeddings,
             )
             hidden_states = layer_out[0]
 
