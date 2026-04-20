@@ -16,7 +16,7 @@ from rouge_score import rouge_scorer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .hub import load_exit_heads, push_benchmark_results_to_hub
-from .inference import BaselineGenerator, EarlyExitGenerator
+from .inference import BaselineGenerator, EarlyExitGenerator, MultiExitGenerator
 from .model_wrapper import EarlyExitLlamaWrapper
 from .utils import freeze_base_model
 
@@ -153,6 +153,7 @@ def benchmark_latency_energy(
     total_energy = 0.0
     total_tokens = 0
     predictions = []
+    generations = []
 
     for i, prompt in enumerate(prompts):
         result = generator.generate(prompt, max_new_tokens=max_new_tokens)
@@ -162,16 +163,19 @@ def benchmark_latency_energy(
         total_energy += result["total_energy_j"]
         total_tokens += result["n_tokens"]
         predictions.append(result["text"])
+        generations.append({
+            "prompt": prompt,
+            "reference": references[i],
+            "generated": result["text"],
+        })
 
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(prompts)}] avg TTFT={sum(ttfts)/len(ttfts):.4f}s")
 
     tokens_per_joule = total_tokens / total_energy if total_energy > 0 else 0.0
-
-    # ROUGE scores against reference summaries
     rouge = compute_rouge(predictions, references)
 
-    return {
+    stats = {
         "ttft_sec_mean": round(sum(ttfts) / len(ttfts), 6),
         "ttft_sec_p50": round(sorted(ttfts)[len(ttfts) // 2], 6),
         "per_token_latency_sec_mean": round(sum(per_token_lats) / len(per_token_lats), 6),
@@ -181,6 +185,67 @@ def benchmark_latency_energy(
         "tokens_per_joule": round(tokens_per_joule, 2),
         **rouge,
     }
+    return stats, generations
+
+
+def benchmark_multi_exit(
+    generator: MultiExitGenerator,
+    samples: List[Dict[str, str]],
+    max_new_tokens: int = 128,
+    warmup: int = 3,
+) -> Dict[str, Dict]:
+    """
+    One forward pass per token — collects latency, energy, and ROUGE for every
+    exit layer simultaneously. Replaces separate per-exit forced runs.
+
+    Returns {
+        "exit_8":  {ttft_sec_mean, per_token_latency_sec_mean, total_energy_j,
+                    tokens_per_joule, rouge2_f1, rougeL_f1},
+        "exit_16": {...},
+        "base":    {...},
+    }
+    """
+    prompts = [s["prompt"] for s in samples]
+    references = [s["reference"] for s in samples]
+
+    for i in range(min(warmup, len(prompts))):
+        generator.generate(prompts[i], max_new_tokens=32)
+
+    # Accumulators per exit key
+    ttfts: Dict[str, List[float]] = {}
+    per_tok_lats: Dict[str, List[float]] = {}
+    energies: Dict[str, float] = {}
+    n_toks: Dict[str, int] = {}
+    predictions: Dict[str, List[str]] = {}
+    generations: List[Dict] = []
+
+    for i, prompt in enumerate(prompts):
+        result = generator.generate(prompt, max_new_tokens=max_new_tokens)
+        row: Dict = {"prompt": prompt, "reference": references[i]}
+        for key, out in result["exits"].items():
+            ttfts.setdefault(key, []).append(out["ttft_sec"])
+            per_tok_lats.setdefault(key, []).append(out["per_token_latency_sec"])
+            energies[key] = energies.get(key, 0.0) + out["total_energy_j"]
+            n_toks[key] = n_toks.get(key, 0) + result["n_tokens"]
+            predictions.setdefault(key, []).append(out["text"])
+            row[key] = out["text"]
+        generations.append(row)
+        if (i + 1) % 10 == 0:
+            print(f"    [{i+1}/{len(prompts)}] multi-exit benchmark")
+
+    stats: Dict[str, Dict] = {}
+    for key in ttfts:
+        rouge = compute_rouge(predictions[key], references)
+        ej = energies[key]
+        tok = n_toks[key]
+        stats[key] = {
+            "ttft_sec_mean": round(sum(ttfts[key]) / len(ttfts[key]), 6),
+            "per_token_latency_sec_mean": round(sum(per_tok_lats[key]) / len(per_tok_lats[key]), 6),
+            "total_energy_j": round(ej, 4),
+            "tokens_per_joule": round(tok / ej if ej > 0 else 0.0, 2),
+            **rouge,
+        }
+    return stats, generations
 
 
 def _compile_exit_heads(exit_heads: Dict[int, torch.nn.Module]) -> Dict[int, torch.nn.Module]:
@@ -302,38 +367,26 @@ def run_full_benchmark(
     # Done with wrapper/hooks for quality — clean up before compile
     wrapper.remove_hooks()
 
-    # ---- Compile MLP per-layer + EE forward as one unit ----
-    # Per-layer MLP compile: covers the heavy FFN matmuls for both EE and
-    # baseline. Self-attn is left eager to avoid RoPE symbolic-shape issues
-    # that arise when cos/sin are inputs to a separately compiled self_attn
-    # graph (Dynamo assigns fresh symbolic vars to head_dim and can't unify
-    # them with the static head_dim inside q_proj.view).
-    #
-    # EE forward is compiled as one unit (compile_runtime=True, dynamic=True).
-    # This puts rotary_emb + q_proj + view + RoPE all in a single Dynamo
-    # trace, so head_dim is a static integer throughout and shapes are
-    # consistent.
+    # ---- Compile MLP per-layer + exit heads ----
     print("\n=== Compiling decoder layers + exit heads (dynamic shapes) ===")
     for layer in base_model.model.layers:
         layer.mlp = torch.compile(layer.mlp, dynamic=True)
     compiled_exit_heads = _compile_exit_heads(exit_heads)
     print(f"  Compiled {len(base_model.model.layers)} MLP layers + {len(compiled_exit_heads)} exit heads")
 
-    # ---- Latency + Energy + ROUGE: per exit layer (forced) ----
-    # Each run forces ALL tokens to exit at a specific layer (threshold=0.0).
-    # This is the real comparison: layer 8 vs 16 vs 24 vs full model.
-    results["per_exit_latency"] = {}
-    for layer_idx in exit_layer_indices:
-        print(f"\n=== Latency/Energy/ROUGE: Forced exit at layer {layer_idx} ===")
-        gen = EarlyExitGenerator(
-            base_model,
-            {layer_idx: compiled_exit_heads[layer_idx]},
-            tokenizer,
-            confidence_threshold=0.0,  # always exit here
-            use_kv_cache=True,
-        )
-        results["per_exit_latency"][f"exit_{layer_idx}"] = benchmark_latency_energy(
-            gen, samples, max_new_tokens
+    # ---- Multi-exit: latency + energy + ROUGE + generations (one pipeline) ----
+    print("\n=== Multi-Exit Benchmark (one pass, shared KV cache) ===")
+    multi_gen = MultiExitGenerator(base_model, compiled_exit_heads, tokenizer)
+    results["per_exit"], results["per_exit_generations"] = benchmark_multi_exit(multi_gen, samples, max_new_tokens)
+    print("\n  Exit       | TTFT(s) | Per-tok(s) | Energy(J) | Tok/J  | R2-F1  | RL-F1")
+    print("  -----------+---------+------------+-----------+--------+--------+------")
+    for key, r in results["per_exit"].items():
+        print(
+            f"  {key:10s} | {r['ttft_sec_mean']:.4f}  | "
+            f"{r['per_token_latency_sec_mean']:.6f} | "
+            f"{r['total_energy_j']:9.2f} | "
+            f"{r['tokens_per_joule']:6.2f} | "
+            f"{r['rouge2_f1']:.4f} | {r['rougeL_f1']:.4f}"
         )
 
     # ---- Latency + Energy + ROUGE: dynamic confidence exit ----
@@ -345,13 +398,13 @@ def run_full_benchmark(
         confidence_threshold,
         use_kv_cache=True,
     )
-    results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
+    results["ee_latency"], results["ee_generations"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
 
     # ---- Latency + Energy + ROUGE: Baseline ----
     print("\n=== Latency/Energy/ROUGE: Baseline (full model) ===")
     baseline_gen = BaselineGenerator(base_model, tokenizer)
-    results["baseline_latency"] = benchmark_latency_energy(baseline_gen, samples, max_new_tokens)
+    results["baseline_latency"], results["baseline_generations"] = benchmark_latency_energy(baseline_gen, samples, max_new_tokens)
 
     # ---- Comparison summary ----
     bl = results["baseline_latency"]
@@ -384,8 +437,8 @@ def run_full_benchmark(
         print("".join(parts))
 
     _row("baseline", bl)
-    for layer_idx in exit_layer_indices:
-        _row(f"exit_{layer_idx}", results["per_exit_latency"][f"exit_{layer_idx}"])
+    for key in results["per_exit"]:
+        _row(key, results["per_exit"][key])
     _row("dynamic_ee", results["ee_latency"])
 
     print("=" * 72)
@@ -394,10 +447,25 @@ def run_full_benchmark(
     if output_path is None:
         output_path = "benchmark_results.json"
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Main stats (no generation text — keep it small)
+    stats_only = {k: v for k, v in results.items() if "generations" not in k}
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+        json.dump(stats_only, f, indent=2)
     print(f"\nResults saved to: {output_path}")
+
+    # Generations — separate file for qualitative inspection
+    gen_path = os.path.join(out_dir, "generations.json")
+    generations_out = {
+        "per_exit": results.get("per_exit_generations", []),
+        "dynamic_ee": results.get("ee_generations", []),
+        "baseline": results.get("baseline_generations", []),
+    }
+    with open(gen_path, "w", encoding="utf-8") as f:
+        json.dump(generations_out, f, indent=2, ensure_ascii=False)
+    print(f"Generations saved to: {gen_path}")
 
     if push_results_to_hub_repo:
         results_url = push_benchmark_results_to_hub(

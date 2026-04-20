@@ -49,14 +49,19 @@ class EarlyExitGenerator:
         tokenizer: PreTrainedTokenizerBase,
         confidence_threshold: float = 0.9,
         use_kv_cache: bool = True,
+        force_exit_layer: Optional[int] = None,
     ):
         self.base_model = base_model
         self.exit_heads = exit_heads
         self.tokenizer = tokenizer
         self.confidence_threshold = confidence_threshold
         self.use_kv_cache = use_kv_cache
+        self.force_exit_layer = force_exit_layer
         self.exit_layer_indices = sorted(exit_heads.keys())
         self.num_layers = len(base_model.model.layers)
+
+        if force_exit_layer is not None and force_exit_layer not in exit_heads:
+            raise ValueError(f"force_exit_layer={force_exit_layer} not in exit_heads {list(exit_heads.keys())}")
 
         self.exit_counts: Dict[int, int] = defaultdict(int)
         self.total_tokens = 0
@@ -96,7 +101,8 @@ class EarlyExitGenerator:
                 probs = F.softmax(logits.squeeze(1), dim=-1)
                 max_prob, token_id = probs.max(dim=-1)
 
-                if max_prob.item() >= self.confidence_threshold:
+                forced = self.force_exit_layer is not None and layer_idx == self.force_exit_layer
+                if forced or max_prob.item() >= self.confidence_threshold:
                     return token_id.item(), layer_idx, max_prob.item()
 
         hidden_states = self.base_model.model.norm(hidden_states)
@@ -180,7 +186,8 @@ class EarlyExitGenerator:
                 logits = head(hidden_states[:, -1:, :])
                 probs = F.softmax(logits.squeeze(1), dim=-1)
                 max_prob, next_id = probs.max(dim=-1)
-                if max_prob.item() >= self.confidence_threshold:
+                forced = self.force_exit_layer is not None and layer_idx == self.force_exit_layer
+                if forced or max_prob.item() >= self.confidence_threshold:
                     return next_id.item(), layer_idx, max_prob.item()
 
         hidden_states = self.base_model.model.norm(hidden_states)
@@ -352,6 +359,209 @@ class EarlyExitGenerator:
     def reset_statistics(self) -> None:
         self.exit_counts.clear()
         self.total_tokens = 0
+
+
+class MultiExitGenerator:
+    """
+    One forward pass per token — collects predictions from ALL exit heads simultaneously.
+    KV cache is shared: layers 0-8 computed once, not repeated for exit_16 or exit_24.
+
+    Base model (final layer) drives next-token selection so all exits see a
+    consistent context. Per-exit texts show what each head would have predicted
+    at each position given the same input sequence.
+
+    Use this for quality comparison (ROUGE per exit). For per-exit latency
+    measurement use EarlyExitGenerator with force_exit_layer instead.
+    """
+
+    def __init__(
+        self,
+        base_model: PreTrainedModel,
+        exit_heads: Dict[int, ExitHead],
+        tokenizer: PreTrainedTokenizerBase,
+    ):
+        self.base_model = base_model
+        self.exit_heads = exit_heads
+        self.tokenizer = tokenizer
+        self.exit_layer_indices = sorted(exit_heads.keys())
+        self.num_layers = len(base_model.model.layers)
+
+    def _run_all_layers(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings,
+        cache_position: torch.Tensor,
+        past_key_values,
+        t_start: float,
+    ) -> Tuple[Dict[int, Tuple[int, float]], Dict[int, float], int, float]:
+        """
+        Run all layers in one pass.
+        Returns:
+            exit_preds:   {layer_idx: (token_id, conf)}
+            exit_elapsed: {layer_idx: seconds_from_t_start_to_this_exit}
+            base_token_id, base_elapsed
+        """
+        exit_preds: Dict[int, Tuple[int, float]] = {}
+        exit_elapsed: Dict[int, float] = {}
+
+        for layer_idx, layer in enumerate(self.base_model.model.layers):
+            layer_out = layer(
+                hidden_states,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                cache_position=cache_position,
+                past_key_value=past_key_values,
+                use_cache=True,
+            )
+            hidden_states = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+
+            if layer_idx in self.exit_heads:
+                torch.cuda.synchronize()
+                exit_elapsed[layer_idx] = time.perf_counter() - t_start
+                head = self.exit_heads[layer_idx]
+                logits = head(hidden_states[:, -1:, :])
+                probs = F.softmax(logits.squeeze(1), dim=-1)
+                max_prob, token_id = probs.max(dim=-1)
+                exit_preds[layer_idx] = (token_id.item(), max_prob.item())
+
+        hidden_states = self.base_model.model.norm(hidden_states)
+        logits = self.base_model.lm_head(hidden_states[:, -1:, :])
+        probs = F.softmax(logits.squeeze(1), dim=-1)
+        max_prob, token_id = probs.max(dim=-1)
+        torch.cuda.synchronize()
+        base_elapsed = time.perf_counter() - t_start
+        return exit_preds, exit_elapsed, token_id.item(), base_elapsed
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 128,
+    ) -> Dict:
+        """
+        Returns per-exit generated texts + latency/energy.
+
+        {
+          "exits": {
+            "exit_8":  {"text": ..., "tokens": [...]},
+            "exit_16": {"text": ..., "tokens": [...]},
+            "exit_24": {"text": ..., "tokens": [...]},
+            "base":    {"text": ..., "tokens": [...]},
+          },
+          "n_tokens": ...,
+          "ttft_sec": ..., "per_token_latency_sec": ..., "end_to_end_sec": ...,
+          "total_energy_j": ..., "tokens_per_joule": ...,
+        }
+        """
+        from transformers.cache_utils import DynamicCache
+
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
+        input_ids = input_ids.to(self.base_model.device)
+        device = input_ids.device
+
+        exit_token_lists: Dict[int, List[int]] = {idx: [] for idx in self.exit_layer_indices}
+        base_token_list: List[int] = []
+        # Per-exit step times and energy: {layer_idx: [(elapsed, power_w)]}
+        exit_step_samples: Dict[int, List[Tuple[float, float]]] = {idx: [] for idx in self.exit_layer_indices}
+        base_step_samples: List[Tuple[float, float]] = []
+        cache = DynamicCache()
+
+        torch.cuda.synchronize()
+        e2e_start = time.perf_counter()
+
+        def _step(hs, pos_ids, pos_emb, cache_pos):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            power_before = _gpu_power_watts()
+            ep, ee, base_tid, base_el = self._run_all_layers(hs, pos_ids, pos_emb, cache_pos, cache, t0)
+            power_after = _gpu_power_watts()
+            avg_pw = (power_before + power_after) / 2.0
+            return ep, ee, base_tid, base_el, avg_pw
+
+        # ---- Prefill ----
+        seq_len = input_ids.shape[1]
+        hidden_states = self.base_model.model.embed_tokens(input_ids)
+        cache_position = torch.arange(seq_len, device=device)
+        position_ids = cache_position.unsqueeze(0)
+        position_embeddings = self.base_model.model.rotary_emb(hidden_states, position_ids)
+
+        exit_preds, exit_elapsed, base_token_id, base_el, avg_pw = _step(
+            hidden_states, position_ids, position_embeddings, cache_position
+        )
+        past_len = seq_len + 1
+
+        for idx, (tid, _) in exit_preds.items():
+            exit_token_lists[idx].append(tid)
+            exit_step_samples[idx].append((exit_elapsed[idx], avg_pw))
+        base_token_list.append(base_token_id)
+        base_step_samples.append((base_el, avg_pw))
+        next_token_id = base_token_id
+
+        # ---- Decode ----
+        if base_token_id != self.tokenizer.eos_token_id:
+            for _ in range(1, max_new_tokens):
+                hidden_states = self.base_model.model.embed_tokens(
+                    torch.tensor([[next_token_id]], device=device)
+                )
+                cache_position = torch.tensor([past_len - 1], device=device)
+                position_ids = cache_position.unsqueeze(0)
+                position_embeddings = self.base_model.model.rotary_emb(hidden_states, position_ids)
+
+                exit_preds, exit_elapsed, base_token_id, base_el, avg_pw = _step(
+                    hidden_states, position_ids, position_embeddings, cache_position
+                )
+                past_len += 1
+
+                for idx, (tid, _) in exit_preds.items():
+                    exit_token_lists[idx].append(tid)
+                    exit_step_samples[idx].append((exit_elapsed[idx], avg_pw))
+                base_token_list.append(base_token_id)
+                base_step_samples.append((base_el, avg_pw))
+                next_token_id = base_token_id
+
+                if base_token_id == self.tokenizer.eos_token_id:
+                    break
+
+        torch.cuda.synchronize()
+        e2e_end = time.perf_counter()
+
+        n_tokens = len(base_token_list)
+
+        def _agg(samples: List[Tuple[float, float]]) -> Dict:
+            times = [t for t, _ in samples]
+            energy_j = sum(t * pw for t, pw in samples)
+            ttft = times[0] if times else 0.0
+            avg_pt = sum(times[1:]) / max(len(times) - 1, 1) if len(times) > 1 else ttft
+            e2e = sum(times)  # total compute attributed to this exit across all steps
+            return {
+                "ttft_sec": round(ttft, 6),
+                "per_token_latency_sec": round(avg_pt, 6),
+                "end_to_end_sec": round(e2e, 6),
+                "total_energy_j": round(energy_j, 4),
+                "tokens_per_joule": round(len(times) / energy_j if energy_j > 0 else 0.0, 2),
+            }
+
+        exits_out: Dict[str, Dict] = {}
+        for idx, tokens in exit_token_lists.items():
+            exits_out[f"exit_{idx}"] = {
+                "text": self.tokenizer.decode(tokens, skip_special_tokens=True),
+                "tokens": tokens,
+                **_agg(exit_step_samples[idx]),
+            }
+        exits_out["base"] = {
+            "text": self.tokenizer.decode(base_token_list, skip_special_tokens=True),
+            "tokens": base_token_list,
+            **_agg(base_step_samples),
+        }
+
+        return {
+            "exits": exits_out,
+            "n_tokens": n_tokens,
+            "end_to_end_sec": round(e2e_end - e2e_start, 6),
+        }
 
 
 class BaselineGenerator:
