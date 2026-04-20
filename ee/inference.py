@@ -71,18 +71,10 @@ class EarlyExitGenerator:
         seq_len = input_ids.shape[1]
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-        # Newer transformers: compute RoPE cos/sin once and pass as
-        # position_embeddings to each decoder layer (layers no longer
-        # compute them internally).
-        position_embeddings = self.base_model.model.rotary_emb(
-            hidden_states, position_ids
-        )
-
         for layer_idx, layer in enumerate(self.base_model.model.layers):
             layer_out = layer(
                 hidden_states,
                 position_ids=position_ids,
-                position_embeddings=position_embeddings,
             )
             hidden_states = layer_out[0]
 
