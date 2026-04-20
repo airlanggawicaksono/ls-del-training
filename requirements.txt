@@ -1,5 +1,6 @@
 huggingface_hub[cli]
-transformers==4.44.2
+transformers
+kernels<0.11.3
 datasets
 accelerate
 torch
