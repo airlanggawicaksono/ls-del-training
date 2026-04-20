@@ -230,9 +230,22 @@ def run_full_benchmark(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch_dtype, device_map="auto", attn_implementation="eager")
+    base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch_dtype, device_map="auto")
     base_model.config.pad_token_id = tokenizer.pad_token_id
     freeze_base_model(base_model)
+
+    # Newer transformers strips the batch dim before LlamaAttention under torch.compile
+    # (hidden_states enters as 2D → input_shape is 1-tuple → wrong q format).
+    # Patch at class level so Dynamo traces the corrected path.
+    import transformers.models.llama.modeling_llama as _llama_mod
+    if not getattr(_llama_mod.LlamaAttention.forward, "_batch_patched", False):
+        _orig_attn_fwd = _llama_mod.LlamaAttention.forward
+        def _attn_fwd_patched(self, hidden_states, *args, **kwargs):
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+            return _orig_attn_fwd(self, hidden_states, *args, **kwargs)
+        _attn_fwd_patched._batch_patched = True
+        _llama_mod.LlamaAttention.forward = _attn_fwd_patched
 
     # ---- Load exit heads ----
     print(f"\n=== Loading exit heads from: {exit_heads_repo_or_dir} ===")
@@ -261,9 +274,11 @@ def run_full_benchmark(
     wrapper.cuda()
 
     # ---- torch.compile ----
-    # Both EE and baseline get fully compiled.
-    #   - EE: compile_runtime=True compiles the entire step fn (embed → layers → exit check)
-    #   - Baseline: torch.compile(model) compiles the whole model for .generate()
+    # MLP layers + exit heads compiled; self_attn left eager.
+    # compile_runtime=True causes Dynamo to trace through LlamaAttention where newer
+    # transformers produces q in (seq, head_dim, num_heads) layout under fake-tensor
+    # propagation, breaking the mul with cos. MLP is the actual compute bottleneck;
+    # attention runs fast via SDPA regardless.
     #   - Quality benchmark runs first BEFORE compile (just perplexity, no speed measurement)
     print("\n=== Quality Benchmark (perplexity / accuracy) ===")
     print("  (runs before compile — quality doesn't need speed optimization)")
@@ -311,7 +326,7 @@ def run_full_benchmark(
         compiled_exit_heads,
         tokenizer,
         confidence_threshold,
-        compile_runtime=True,  # whole step fn compiled as one unit; avoids RoPE shape issues
+        compile_runtime=True,
     )
     results["ee_latency"] = benchmark_latency_energy(ee_gen, samples, max_new_tokens)
     ee_gen.print_exit_statistics()
