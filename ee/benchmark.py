@@ -202,8 +202,10 @@ def benchmark_latency_energy(
             "tokens_per_joule": result.get("tokens_per_joule", 0.0),
             "avg_gpu_util_pct": result.get("avg_gpu_util_pct", 0.0),
             "avg_gpu_mem_util_pct": result.get("avg_gpu_mem_util_pct", 0.0),
+            "avg_vram_gb": result.get("avg_vram_gb", 0.0),
             "avg_power_w": result.get("avg_power_w", 0.0),
             "avg_cpu_pct": result.get("avg_cpu_pct", 0.0),
+            "avg_ram_gb": result.get("avg_ram_gb", 0.0),
             "avg_gpu_sm_clock_mhz": result.get("avg_gpu_sm_clock_mhz", 0.0),
             "avg_gpu_mem_clock_mhz": result.get("avg_gpu_mem_clock_mhz", 0.0),
         })
@@ -283,6 +285,23 @@ def benchmark_per_exit(
             g["forced_exit_layer"] = idx
             g["exit_key"] = key
         all_generations.extend(gens)
+
+    # Base: no force exit, threshold=1.1 → always runs all 32 layers
+    print(f"\n  --- Per-exit benchmark: base (all 32 layers) ---")
+    base_gen = EarlyExitGenerator(
+        base_model,
+        exit_heads,
+        tokenizer,
+        confidence_threshold=1.1,
+        use_kv_cache=True,
+        force_exit_layer=None,
+    )
+    base_stats, base_gens = benchmark_latency_energy(base_gen, samples, max_new_tokens, warmup)
+    all_stats["base"] = base_stats
+    for g in base_gens:
+        g["forced_exit_layer"] = None
+        g["exit_key"] = "base"
+    all_generations.extend(base_gens)
 
     return all_stats, all_generations
 
@@ -421,17 +440,26 @@ def run_full_benchmark(
     results["per_exit"], results["per_exit_generations"] = benchmark_per_exit(
         base_model, compiled_exit_heads, tokenizer, samples, exit_layer_indices, max_new_tokens
     )
-    print("\n  Exit       | TTFT(s) | Per-tok(s) | E2E(s)  | Energy(J) | Tok/J  | R2-F1  | RL-F1")
-    print("  -----------+---------+------------+---------+-----------+--------+--------+------")
+    _pe_cols = [
+        ("ttft_sec_mean",              "TTFT(s)",     8,  ".4f"),
+        ("per_token_latency_sec_mean", "Per-tok(s)", 10,  ".6f"),
+        ("end_to_end_sec_mean",        "E2E(s)",      8,  ".4f"),
+        ("total_energy_j",             "Energy(J)",  10,  ".2f"),
+        ("joules_per_token",           "J/tok",       7,  ".4f"),
+        ("avg_power_w",                "Power(W)",    8,  ".1f"),
+        ("avg_vram_gb",                "VRAM(GB)",    8,  ".3f"),
+        ("avg_ram_gb",                 "RAM(GB)",     7,  ".3f"),
+        ("avg_gpu_util_pct",           "GPU%",        6,  ".1f"),
+        ("avg_gpu_sm_clock_mhz",       "SM(MHz)",     7,  ".0f"),
+        ("rouge2_f1",                  "R2-F1",       7,  ".4f"),
+        ("rougeL_f1",                  "RL-F1",       7,  ".4f"),
+    ]
+    hdr = "  " + f"{'Exit':<10s}" + "".join(f" {c[1]:>{c[2]}s}" for c in _pe_cols)
+    print("\n" + hdr)
+    print("  " + "-" * (10 + sum(c[2] + 1 for c in _pe_cols)))
     for key, r in results["per_exit"].items():
-        print(
-            f"  {key:10s} | {r['ttft_sec_mean']:.4f}  | "
-            f"{r['per_token_latency_sec_mean']:.6f} | "
-            f"{r['end_to_end_sec_mean']:.4f}  | "
-            f"{r['total_energy_j']:9.2f} | "
-            f"{r['tokens_per_joule']:6.2f} | "
-            f"{r['rouge2_f1']:.4f} | {r['rougeL_f1']:.4f}"
-        )
+        row_s = f"  {key:<10s}" + "".join(f" {r.get(c[0], 0):{c[2]}{c[3]}}" for c in _pe_cols)
+        print(row_s)
 
     # ---- Dynamic early exit: per-token confidence check at each exit layer.
     # Prefill runs full 32-layer forward; decode uses KV cache.
