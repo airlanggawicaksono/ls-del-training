@@ -15,7 +15,7 @@ from datasets import load_dataset
 from rouge_score import rouge_scorer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .hub import load_exit_heads, push_benchmark_results_to_hub
+from .hub import load_exit_heads
 from .inference import BaselineGenerator, EarlyExitGenerator, MultiExitGenerator
 from .model_wrapper import EarlyExitLlamaWrapper
 from .utils import freeze_base_model
@@ -179,10 +179,27 @@ def benchmark_latency_energy(
             per_sample_exit_layers.append(result["exit_layers"])
         predictions.append(result["text"])
         generations.append({
+            "sample_idx": i,
             "prompt": prompt,
             "reference": references[i],
             "generated": result["text"],
+            "tokens": result.get("tokens", []),
             "exit_layers": result.get("exit_layers", []),
+            "confidences": result.get("confidences", []),
+            "exit_stats": result.get("exit_stats", {}),
+            "n_tokens": result["n_tokens"],
+            "ttft_sec": result["ttft_sec"],
+            "per_token_latency_sec": result["per_token_latency_sec"],
+            "end_to_end_sec": result["end_to_end_sec"],
+            "total_energy_j": result["total_energy_j"],
+            "joules_per_token": result.get("joules_per_token", 0.0),
+            "tokens_per_joule": result.get("tokens_per_joule", 0.0),
+            "avg_gpu_util_pct": result.get("avg_gpu_util_pct", 0.0),
+            "avg_gpu_mem_util_pct": result.get("avg_gpu_mem_util_pct", 0.0),
+            "avg_power_w": result.get("avg_power_w", 0.0),
+            "avg_cpu_pct": result.get("avg_cpu_pct", 0.0),
+            "avg_gpu_sm_clock_mhz": result.get("avg_gpu_sm_clock_mhz", 0.0),
+            "avg_gpu_mem_clock_mhz": result.get("avg_gpu_mem_clock_mhz", 0.0),
         })
 
         if (i + 1) % 10 == 0:
@@ -273,7 +290,25 @@ def benchmark_multi_exit(
             if out.get("avg_cpu_pct", 0) > 0:
                 cpu_pcts.setdefault(key, []).append(out["avg_cpu_pct"])
             predictions.setdefault(key, []).append(out["text"])
-            row[key] = out["text"]
+            row[key] = {
+                "text": out["text"],
+                "tokens": out.get("tokens", []),
+                "n_tokens": result["n_tokens"],
+                "ttft_sec": out["ttft_sec"],
+                "per_token_latency_sec": out["per_token_latency_sec"],
+                "end_to_end_sec": out["end_to_end_sec"],
+                "total_energy_j": out["total_energy_j"],
+                "joules_per_token": out.get("joules_per_token", 0.0),
+                "tokens_per_joule": out.get("tokens_per_joule", 0.0),
+                "avg_gpu_util_pct": out.get("avg_gpu_util_pct", 0.0),
+                "avg_gpu_mem_util_pct": out.get("avg_gpu_mem_util_pct", 0.0),
+                "avg_power_w": out.get("avg_power_w", 0.0),
+                "avg_cpu_pct": out.get("avg_cpu_pct", 0.0),
+                "avg_gpu_sm_clock_mhz": out.get("avg_gpu_sm_clock_mhz", 0.0),
+                "avg_gpu_mem_clock_mhz": out.get("avg_gpu_mem_clock_mhz", 0.0),
+            }
+        row["sample_idx"] = i
+        row["reference"] = references[i]
         generations.append(row)
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(prompts)}] multi-exit benchmark")
@@ -322,7 +357,6 @@ def run_full_benchmark(
     max_new_tokens: int = 128,
     confidence_threshold: float = 0.9,
     torch_dtype=torch.bfloat16,
-    output_path: Optional[str] = None,
     push_results_to_hub_repo: Optional[str] = None,
     push_results_path_in_repo: Optional[str] = None,
 ) -> Dict:
@@ -499,36 +533,37 @@ def run_full_benchmark(
 
     print("=" * 72)
 
-    # ---- Save ----
-    if output_path is None:
-        output_path = "benchmark_results.json"
+    # ---- Push to Hub ----
+    if not push_results_to_hub_repo:
+        raise ValueError("push_results_to_hub_repo is required — results are pushed to HF Hub, not saved to disk.")
 
-    out_dir = os.path.dirname(output_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
+    import tempfile
+    from huggingface_hub import HfApi
 
-    # Main stats (no generation text — keep it small)
-    stats_only = {k: v for k, v in results.items() if "generations" not in k}
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(stats_only, f, indent=2)
-    print(f"\nResults saved to: {output_path}")
+    api = HfApi()
+    api.create_repo(push_results_to_hub_repo, repo_type="dataset", exist_ok=True)
 
-    # Generations — separate file for qualitative inspection
-    gen_path = os.path.join(out_dir, "generations.json")
-    generations_out = {
-        "per_exit": results.get("per_exit_generations", []),
-        "dynamic_ee": results.get("ee_generations", []),
-        "baseline": results.get("baseline_generations", []),
+    hub_dir = push_results_path_in_repo or "benchmark"
+
+    files_to_push = {
+        "benchmark_results.json": {k: v for k, v in results.items() if "generations" not in k},
+        "samples_per_exit.json":   results.get("per_exit_generations", []),
+        "samples_dynamic_ee.json": results.get("ee_generations", []),
+        "samples_baseline.json":   results.get("baseline_generations", []),
     }
-    with open(gen_path, "w", encoding="utf-8") as f:
-        json.dump(generations_out, f, indent=2, ensure_ascii=False)
-    print(f"Generations saved to: {gen_path}")
 
-    if push_results_to_hub_repo:
-        results_url = push_benchmark_results_to_hub(
-            results_json_path=output_path,
+    for fname, data in files_to_push.items():
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+            json.dump(data, tmp, indent=2, ensure_ascii=False)
+            tmp_path = tmp.name
+        url = api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=f"{hub_dir}/{fname}",
             repo_id=push_results_to_hub_repo,
-            path_in_repo=push_results_path_in_repo,
+            repo_type="dataset",
+            commit_message=f"Upload {fname}",
         )
-        print(f"Results pushed to Hub: {results_url}")
+        os.unlink(tmp_path)
+        print(f"Pushed {fname} → {url}")
 
     return results
