@@ -109,20 +109,19 @@ class EarlyExitLlamaWrapper(nn.Module):
         # no_grad is safe because we detach hook outputs anyway, and the
         # base model params have requires_grad=False.
         with torch.no_grad():
-            base_out = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
+            with torch.profiler.record_function("base_model_forward"):
+                base_out = self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
 
-        # Pass each captured hidden state through its exit head.
-        # These *do* build a grad graph (exit heads are trainable).
         exit_logits: Dict[int, torch.Tensor] = {}
-        for idx in self.exit_layer_indices:
-            hidden = self._intermediate_outputs[idx]
-            # Re-enable grad for the exit head forward
-            hidden = hidden.requires_grad_(True)
-            exit_logits[idx] = self.exit_heads[str(idx)](hidden)
+        with torch.profiler.record_function("exit_heads_forward"):
+            for idx in self.exit_layer_indices:
+                hidden = self._intermediate_outputs[idx]
+                hidden = hidden.requires_grad_(True)
+                exit_logits[idx] = self.exit_heads[str(idx)](hidden)
 
         self._intermediate_outputs.clear()
 

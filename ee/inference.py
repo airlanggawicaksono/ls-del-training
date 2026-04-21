@@ -2,6 +2,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import psutil
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -11,22 +12,38 @@ from .exit_head import ExitHead
 _nvml_available = False
 try:
     import pynvml
-
     pynvml.nvmlInit()
     _nvml_available = True
 except Exception:
     pass
 
+_psutil_process = psutil.Process()
 
-def _gpu_power_watts() -> float:
-    """Current GPU power draw in watts. Returns 0 if unavailable."""
-    if not _nvml_available:
-        return 0.0
-    try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        return pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # mW -> W
-    except Exception:
-        return 0.0
+
+def _sample_hw() -> Dict[str, float]:
+    """Snapshot GPU power/util/mem/clocks + CPU usage. Returns empty dict on failure."""
+    out: Dict[str, float] = {}
+    if _nvml_available:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            out["power_w"] = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            out["gpu_util_pct"] = float(util.gpu)
+            out["gpu_mem_util_pct"] = float(util.memory)
+            out["gpu_sm_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+            out["gpu_mem_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM))
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        out["vram_allocated_gb"] = round(torch.cuda.memory_allocated() / (1024**3), 3)
+    out["cpu_pct"] = _psutil_process.cpu_percent()
+    return out
+
+
+def _avg_hw(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+    """Average two hw snapshots (start + end of a step)."""
+    keys = set(a) | set(b)
+    return {k: (a.get(k, 0.0) + b.get(k, 0.0)) / 2.0 for k in keys}
 
 
 class EarlyExitGenerator:
@@ -222,7 +239,8 @@ class EarlyExitGenerator:
         confidences: List[float] = []
         per_token_times: List[float] = []
         call_exit_counts: Dict[int, int] = defaultdict(int)
-        energy_samples: List[Tuple[float, float]] = []
+        # each entry: (step_time, hw_snapshot_avg)
+        hw_samples: List[Tuple[float, Dict[str, float]]] = []
 
         torch.cuda.synchronize()
         e2e_start = time.perf_counter()
@@ -231,20 +249,19 @@ class EarlyExitGenerator:
             # ---- Prefill ----
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            power_before = _gpu_power_watts()
+            hw_before = _sample_hw()
 
             first_token_id, first_conf, past_kv = self._prefill(input_ids)
             past_len = input_ids.shape[1]
 
             torch.cuda.synchronize()
             t1 = time.perf_counter()
-            power_after = _gpu_power_watts()
+            hw_after = _sample_hw()
 
             step_time = t1 - t0
             per_token_times.append(step_time)
-            energy_samples.append((step_time, (power_before + power_after) / 2.0))
+            hw_samples.append((step_time, _avg_hw(hw_before, hw_after)))
 
-            # Prefill always uses full model
             exit_layer = self.num_layers - 1
             generated_tokens.append(first_token_id)
             exit_layers.append(exit_layer)
@@ -259,7 +276,7 @@ class EarlyExitGenerator:
                 for _ in range(1, max_new_tokens):
                     torch.cuda.synchronize()
                     t0 = time.perf_counter()
-                    power_before = _gpu_power_watts()
+                    hw_before = _sample_hw()
 
                     token_id, exit_layer, conf = self._decode_one_kv(
                         generated_tokens[-1], past_kv, past_len
@@ -267,11 +284,11 @@ class EarlyExitGenerator:
 
                     torch.cuda.synchronize()
                     t1 = time.perf_counter()
-                    power_after = _gpu_power_watts()
+                    hw_after = _sample_hw()
 
                     step_time = t1 - t0
                     per_token_times.append(step_time)
-                    energy_samples.append((step_time, (power_before + power_after) / 2.0))
+                    hw_samples.append((step_time, _avg_hw(hw_before, hw_after)))
 
                     generated_tokens.append(token_id)
                     exit_layers.append(exit_layer)
@@ -285,21 +302,21 @@ class EarlyExitGenerator:
                         break
 
         else:
-            # ---- No-KV path: reprocess full context every step ----
+            # ---- No-KV path ----
             for step in range(max_new_tokens):
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                power_before = _gpu_power_watts()
+                hw_before = _sample_hw()
 
                 token_id, exit_layer, conf = self._step_fn(input_ids)
 
                 torch.cuda.synchronize()
                 t1 = time.perf_counter()
-                power_after = _gpu_power_watts()
+                hw_after = _sample_hw()
 
                 step_time = t1 - t0
                 per_token_times.append(step_time)
-                energy_samples.append((step_time, (power_before + power_after) / 2.0))
+                hw_samples.append((step_time, _avg_hw(hw_before, hw_after)))
 
                 generated_tokens.append(token_id)
                 exit_layers.append(exit_layer)
@@ -323,8 +340,12 @@ class EarlyExitGenerator:
         ttft = per_token_times[0] if per_token_times else 0.0
         avg_per_token = sum(per_token_times[1:]) / max(len(per_token_times) - 1, 1) if n_tokens > 1 else ttft
 
-        total_energy_j = sum(dt * pw for dt, pw in energy_samples)
+        total_energy_j = sum(dt * hw.get("power_w", 0.0) for dt, hw in hw_samples)
         tokens_per_joule = n_tokens / total_energy_j if total_energy_j > 0 else 0.0
+
+        def _mean(key):
+            vals = [hw.get(key, 0.0) for _, hw in hw_samples if key in hw]
+            return round(sum(vals) / len(vals), 2) if vals else 0.0
 
         return {
             "text": text,
@@ -337,9 +358,16 @@ class EarlyExitGenerator:
             "ttft_sec": round(ttft, 6),
             "per_token_latency_sec": round(avg_per_token, 6),
             "end_to_end_sec": round(e2e_sec, 6),
-            # Energy
+            # Energy + HW
             "total_energy_j": round(total_energy_j, 4),
             "tokens_per_joule": round(tokens_per_joule, 2),
+            "joules_per_token": round(total_energy_j / n_tokens if n_tokens > 0 else 0.0, 6),
+            "avg_gpu_util_pct": _mean("gpu_util_pct"),
+            "avg_gpu_mem_util_pct": _mean("gpu_mem_util_pct"),
+            "avg_power_w": _mean("power_w"),
+            "avg_cpu_pct": _mean("cpu_pct"),
+            "avg_gpu_sm_clock_mhz": _mean("gpu_sm_clock_mhz"),
+            "avg_gpu_mem_clock_mhz": _mean("gpu_mem_clock_mhz"),
         }
 
     def print_exit_statistics(self) -> None:
@@ -464,9 +492,9 @@ class MultiExitGenerator:
 
         exit_token_lists: Dict[int, List[int]] = {idx: [] for idx in self.exit_layer_indices}
         base_token_list: List[int] = []
-        # Per-exit step times and energy: {layer_idx: [(elapsed, power_w)]}
-        exit_step_samples: Dict[int, List[Tuple[float, float]]] = {idx: [] for idx in self.exit_layer_indices}
-        base_step_samples: List[Tuple[float, float]] = []
+        # Per-exit step samples: {layer_idx: [(elapsed, hw_snapshot)]}
+        exit_step_samples: Dict[int, List[Tuple[float, Dict]]] = {idx: [] for idx in self.exit_layer_indices}
+        base_step_samples: List[Tuple[float, Dict]] = []
         cache = DynamicCache()
 
         torch.cuda.synchronize()
@@ -475,11 +503,11 @@ class MultiExitGenerator:
         def _step(hs, pos_ids, pos_emb, cache_pos):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            power_before = _gpu_power_watts()
+            hw_before = _sample_hw()
             ep, ee, base_tid, base_el = self._run_all_layers(hs, pos_ids, pos_emb, cache_pos, cache, t0)
-            power_after = _gpu_power_watts()
-            avg_pw = (power_before + power_after) / 2.0
-            return ep, ee, base_tid, base_el, avg_pw
+            hw_after = _sample_hw()
+            avg_hw = _avg_hw(hw_before, hw_after)
+            return ep, ee, base_tid, base_el, avg_hw
 
         # ---- Prefill ----
         seq_len = input_ids.shape[1]
@@ -488,16 +516,16 @@ class MultiExitGenerator:
         position_ids = cache_position.unsqueeze(0)
         position_embeddings = self.base_model.model.rotary_emb(hidden_states, position_ids)
 
-        exit_preds, exit_elapsed, base_token_id, base_el, avg_pw = _step(
+        exit_preds, exit_elapsed, base_token_id, base_el, avg_hw = _step(
             hidden_states, position_ids, position_embeddings, cache_position
         )
         past_len = seq_len + 1
 
         for idx, (tid, _) in exit_preds.items():
             exit_token_lists[idx].append(tid)
-            exit_step_samples[idx].append((exit_elapsed[idx], avg_pw))
+            exit_step_samples[idx].append((exit_elapsed[idx], avg_hw))
         base_token_list.append(base_token_id)
-        base_step_samples.append((base_el, avg_pw))
+        base_step_samples.append((base_el, avg_hw))
         next_token_id = base_token_id
 
         # ---- Decode ----
@@ -510,16 +538,16 @@ class MultiExitGenerator:
                 position_ids = cache_position.unsqueeze(0)
                 position_embeddings = self.base_model.model.rotary_emb(hidden_states, position_ids)
 
-                exit_preds, exit_elapsed, base_token_id, base_el, avg_pw = _step(
+                exit_preds, exit_elapsed, base_token_id, base_el, avg_hw = _step(
                     hidden_states, position_ids, position_embeddings, cache_position
                 )
                 past_len += 1
 
                 for idx, (tid, _) in exit_preds.items():
                     exit_token_lists[idx].append(tid)
-                    exit_step_samples[idx].append((exit_elapsed[idx], avg_pw))
+                    exit_step_samples[idx].append((exit_elapsed[idx], avg_hw))
                 base_token_list.append(base_token_id)
-                base_step_samples.append((base_el, avg_pw))
+                base_step_samples.append((base_el, avg_hw))
                 next_token_id = base_token_id
 
                 if base_token_id == self.tokenizer.eos_token_id:
@@ -530,18 +558,28 @@ class MultiExitGenerator:
 
         n_tokens = len(base_token_list)
 
-        def _agg(samples: List[Tuple[float, float]]) -> Dict:
+        def _agg(samples: List[Tuple[float, Dict]]) -> Dict:
             times = [t for t, _ in samples]
-            energy_j = sum(t * pw for t, pw in samples)
+            energy_j = sum(t * hw.get("power_w", 0.0) for t, hw in samples)
             ttft = times[0] if times else 0.0
             avg_pt = sum(times[1:]) / max(len(times) - 1, 1) if len(times) > 1 else ttft
-            e2e = sum(times)  # total compute attributed to this exit across all steps
+            e2e = sum(times)
+            def _mean(key):
+                vals = [hw.get(key, 0.0) for _, hw in samples if key in hw]
+                return round(sum(vals) / len(vals), 2) if vals else 0.0
             return {
                 "ttft_sec": round(ttft, 6),
                 "per_token_latency_sec": round(avg_pt, 6),
                 "end_to_end_sec": round(e2e, 6),
                 "total_energy_j": round(energy_j, 4),
                 "tokens_per_joule": round(len(times) / energy_j if energy_j > 0 else 0.0, 2),
+                "joules_per_token": round(energy_j / len(times) if len(times) > 0 else 0.0, 6),
+                "avg_gpu_util_pct": _mean("gpu_util_pct"),
+                "avg_gpu_mem_util_pct": _mean("gpu_mem_util_pct"),
+                "avg_power_w": _mean("power_w"),
+                "avg_cpu_pct": _mean("cpu_pct"),
+                "avg_gpu_sm_clock_mhz": _mean("gpu_sm_clock_mhz"),
+                "avg_gpu_mem_clock_mhz": _mean("gpu_mem_clock_mhz"),
             }
 
         exits_out: Dict[str, Dict] = {}
@@ -598,7 +636,7 @@ class BaselineGenerator:
         prompt_len = input_ids.shape[1]
 
         torch.cuda.synchronize()
-        power_start = _gpu_power_watts()
+        hw_start = _sample_hw()
         e2e_start = time.perf_counter()
 
         out = self.model.generate(
@@ -611,7 +649,7 @@ class BaselineGenerator:
 
         torch.cuda.synchronize()
         e2e_end = time.perf_counter()
-        power_end = _gpu_power_watts()
+        hw_end = _sample_hw()
 
         generated_ids = out[0, prompt_len:].tolist()
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -621,7 +659,8 @@ class BaselineGenerator:
         ttft = e2e_sec / max(n_tokens, 1)
         avg_per_token = (e2e_sec - ttft) / max(n_tokens - 1, 1) if n_tokens > 1 else ttft
 
-        avg_power = (power_start + power_end) / 2.0
+        avg_hw = _avg_hw(hw_start, hw_end)
+        avg_power = avg_hw.get("power_w", 0.0)
         total_energy_j = avg_power * e2e_sec
         tokens_per_joule = n_tokens / total_energy_j if total_energy_j > 0 else 0.0
 
@@ -634,7 +673,14 @@ class BaselineGenerator:
             "ttft_sec": round(ttft, 6),
             "per_token_latency_sec": round(avg_per_token, 6),
             "end_to_end_sec": round(e2e_sec, 6),
-            # Energy
+            # Energy + HW
             "total_energy_j": round(total_energy_j, 4),
             "tokens_per_joule": round(tokens_per_joule, 2),
+            "joules_per_token": round(total_energy_j / n_tokens if n_tokens > 0 else 0.0, 6),
+            "avg_gpu_util_pct": round(avg_hw.get("gpu_util_pct", 0.0), 2),
+            "avg_gpu_mem_util_pct": round(avg_hw.get("gpu_mem_util_pct", 0.0), 2),
+            "avg_power_w": round(avg_power, 2),
+            "avg_cpu_pct": round(avg_hw.get("cpu_pct", 0.0), 2),
+            "avg_gpu_sm_clock_mhz": round(avg_hw.get("gpu_sm_clock_mhz", 0.0), 1),
+            "avg_gpu_mem_clock_mhz": round(avg_hw.get("gpu_mem_clock_mhz", 0.0), 1),
         }

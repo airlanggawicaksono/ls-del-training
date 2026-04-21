@@ -152,6 +152,11 @@ def benchmark_latency_energy(
     e2e_lats = []
     total_energy = 0.0
     total_tokens = 0
+    gpu_utils = []
+    gpu_mem_utils = []
+    power_ws = []
+    cpu_pcts = []
+    per_sample_exit_layers = []
     predictions = []
     generations = []
 
@@ -162,18 +167,38 @@ def benchmark_latency_energy(
         e2e_lats.append(result["end_to_end_sec"])
         total_energy += result["total_energy_j"]
         total_tokens += result["n_tokens"]
+        if result.get("avg_gpu_util_pct", 0) > 0:
+            gpu_utils.append(result["avg_gpu_util_pct"])
+        if result.get("avg_gpu_mem_util_pct", 0) > 0:
+            gpu_mem_utils.append(result["avg_gpu_mem_util_pct"])
+        if result.get("avg_power_w", 0) > 0:
+            power_ws.append(result["avg_power_w"])
+        if result.get("avg_cpu_pct", 0) > 0:
+            cpu_pcts.append(result["avg_cpu_pct"])
+        if "exit_layers" in result:
+            per_sample_exit_layers.append(result["exit_layers"])
         predictions.append(result["text"])
         generations.append({
             "prompt": prompt,
             "reference": references[i],
             "generated": result["text"],
+            "exit_layers": result.get("exit_layers", []),
         })
 
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(prompts)}] avg TTFT={sum(ttfts)/len(ttfts):.4f}s")
 
     tokens_per_joule = total_tokens / total_energy if total_energy > 0 else 0.0
+    joules_per_token = total_energy / total_tokens if total_tokens > 0 else 0.0
     rouge = compute_rouge(predictions, references)
+
+    def _mean(lst): return round(sum(lst) / len(lst), 2) if lst else 0.0
+
+    # Token-level exit layer distribution across all samples
+    all_exit_layers = [l for sample in per_sample_exit_layers for l in sample]
+    exit_layer_dist: Dict[str, int] = {}
+    for l in all_exit_layers:
+        exit_layer_dist[str(l)] = exit_layer_dist.get(str(l), 0) + 1
 
     stats = {
         "ttft_sec_mean": round(sum(ttfts) / len(ttfts), 6),
@@ -183,6 +208,12 @@ def benchmark_latency_energy(
         "total_tokens": total_tokens,
         "total_energy_j": round(total_energy, 4),
         "tokens_per_joule": round(tokens_per_joule, 2),
+        "joules_per_token": round(joules_per_token, 6),
+        "avg_gpu_util_pct": _mean(gpu_utils),
+        "avg_gpu_mem_util_pct": _mean(gpu_mem_utils),
+        "avg_power_w": _mean(power_ws),
+        "avg_cpu_pct": _mean(cpu_pcts),
+        "exit_layer_distribution": exit_layer_dist,
         **rouge,
     }
     return stats, generations
@@ -217,6 +248,10 @@ def benchmark_multi_exit(
     e2e_lats: Dict[str, List[float]] = {}
     energies: Dict[str, float] = {}
     n_toks: Dict[str, int] = {}
+    gpu_utils: Dict[str, List[float]] = {}
+    gpu_mem_utils: Dict[str, List[float]] = {}
+    power_ws: Dict[str, List[float]] = {}
+    cpu_pcts: Dict[str, List[float]] = {}
     predictions: Dict[str, List[str]] = {}
     generations: List[Dict] = []
 
@@ -229,11 +264,21 @@ def benchmark_multi_exit(
             e2e_lats.setdefault(key, []).append(out["end_to_end_sec"])
             energies[key] = energies.get(key, 0.0) + out["total_energy_j"]
             n_toks[key] = n_toks.get(key, 0) + result["n_tokens"]
+            if out.get("avg_gpu_util_pct", 0) > 0:
+                gpu_utils.setdefault(key, []).append(out["avg_gpu_util_pct"])
+            if out.get("avg_gpu_mem_util_pct", 0) > 0:
+                gpu_mem_utils.setdefault(key, []).append(out["avg_gpu_mem_util_pct"])
+            if out.get("avg_power_w", 0) > 0:
+                power_ws.setdefault(key, []).append(out["avg_power_w"])
+            if out.get("avg_cpu_pct", 0) > 0:
+                cpu_pcts.setdefault(key, []).append(out["avg_cpu_pct"])
             predictions.setdefault(key, []).append(out["text"])
             row[key] = out["text"]
         generations.append(row)
         if (i + 1) % 10 == 0:
             print(f"    [{i+1}/{len(prompts)}] multi-exit benchmark")
+
+    def _mean(lst): return round(sum(lst) / len(lst), 2) if lst else 0.0
 
     stats: Dict[str, Dict] = {}
     for key in ttfts:
@@ -246,6 +291,11 @@ def benchmark_multi_exit(
             "end_to_end_sec_mean": round(sum(e2e_lats[key]) / len(e2e_lats[key]), 6),
             "total_energy_j": round(ej, 4),
             "tokens_per_joule": round(tok / ej if ej > 0 else 0.0, 2),
+            "joules_per_token": round(ej / tok if tok > 0 else 0.0, 6),
+            "avg_gpu_util_pct": _mean(gpu_utils.get(key, [])),
+            "avg_gpu_mem_util_pct": _mean(gpu_mem_utils.get(key, [])),
+            "avg_power_w": _mean(power_ws.get(key, [])),
+            "avg_cpu_pct": _mean(cpu_pcts.get(key, [])),
             **rouge,
         }
     return stats, generations
@@ -289,6 +339,8 @@ def run_full_benchmark(
       7. Save JSON results
       8. Optional: push JSON results to HF Hub
     """
+    torch.set_float32_matmul_precision("high")
+
     print(f"=== Loading CNN/DailyMail ({n_samples} samples) ===")
     samples = load_cnn_dailymail(n_samples)
 

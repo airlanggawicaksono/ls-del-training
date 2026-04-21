@@ -4,6 +4,7 @@ from typing import Dict, List
 
 import psutil
 import torch
+from torch.profiler import ProfilerActivity, profile, schedule
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
 _nvml_available = False
@@ -42,12 +43,18 @@ def _gpu_utilization() -> Dict[str, float]:
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
         power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
-        return {
+        out = {
             "gpu/utilization_pct": float(util.gpu),
             "gpu/memory_util_pct": float(util.memory),
             "gpu/temperature_c": float(temp),
             "gpu/power_w": round(power, 1),
         }
+        try:
+            out["gpu/sm_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+            out["gpu/mem_clock_mhz"] = float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM))
+        except Exception:
+            pass
+        return out
     except Exception:
         return {}
 
@@ -101,6 +108,7 @@ class TrainingMetricsCallback(TrainerCallback):
         self._process.cpu_percent()
 
         self._pending: Dict[str, float] = {}
+        self._pending_step: int = -1
         self._total_energy_j: float = 0.0
 
         # Hardware buffers — reset each epoch
@@ -174,11 +182,13 @@ class TrainingMetricsCallback(TrainerCallback):
 
         # Buffer hardware metrics for epoch aggregation
         for key in ("gpu/utilization_pct", "gpu/power_w", "gpu/vram_allocated_gb",
-                    "gpu/vram_peak_gb", "cpu/usage_pct", "throughput/tokens_per_sec"):
+                    "gpu/vram_peak_gb", "cpu/usage_pct", "throughput/tokens_per_sec",
+                    "gpu/sm_clock_mhz", "gpu/mem_clock_mhz"):
             if key in m:
                 self._hw[key].append(m[key])
 
         self._pending = m
+        self._pending_step = int(state.global_step)
 
     def on_log(
         self,
@@ -191,8 +201,13 @@ class TrainingMetricsCallback(TrainerCallback):
         if logs is None:
             return
         # Inject hardware metrics into live log pipeline
-        if self._pending:
+        if self._pending and int(state.global_step) == self._pending_step:
             logs.update(self._pending)
+            # Ensure metrics are persisted even if this callback runs after
+            # the internal callback that appends to state.log_history.
+            if state.log_history:
+                state.log_history[-1].update(self._pending)
+            self._pending = {}
 
         # Scrape per-exit losses from the trainer's log dict
         for key, val in logs.items():
@@ -224,6 +239,8 @@ class TrainingMetricsCallback(TrainerCallback):
             },
             "cpu_usage_pct": _stats(hw.get("cpu/usage_pct", [])),
             "tokens_per_sec": _stats(hw.get("throughput/tokens_per_sec", [])),
+            "gpu_sm_clock_mhz": _stats(hw.get("gpu/sm_clock_mhz", [])),
+            "gpu_mem_clock_mhz": _stats(hw.get("gpu/mem_clock_mhz", [])),
         }
 
         exits = {
@@ -284,3 +301,51 @@ class TrainingMetricsCallback(TrainerCallback):
         print(f"  CPU RAM (now): {cpu_gb:.2f} GB / {ram_total} GB")
         print(f"  CPU cores:     {caps.get('cpu_count_physical', '?')} physical / {caps.get('cpu_count_logical', '?')} logical")
         print("------------------------\n")
+
+
+class TorchProfilerCallback(TrainerCallback):
+    """
+    Runs torch.profiler for `active_steps` steps after `warmup_steps` warmup.
+    Exports Chrome trace + TensorBoard trace to `output_dir/profiler/`.
+
+    Use this for a short profiling run (20-50 steps) to get per-op CUDA
+    timing and memory breakdown for base_model_forward vs exit_heads_forward
+    vs backward — the record_function labels in EarlyExitLlamaWrapper.forward
+    show up as named regions in the trace.
+    """
+
+    def __init__(self, output_dir: str, warmup_steps: int = 2, active_steps: int = 5):
+        self.output_dir = output_dir
+        self.warmup_steps = warmup_steps
+        self.active_steps = active_steps
+        self._profiler = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        import os
+        trace_dir = os.path.join(self.output_dir, "profiler")
+        os.makedirs(trace_dir, exist_ok=True)
+        self._profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=0, warmup=self.warmup_steps, active=self.active_steps, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        )
+        self._profiler.start()
+        print(f"[Profiler] started — trace will save to {trace_dir}")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._profiler is not None:
+            self._profiler.step()
+            total = self.warmup_steps + self.active_steps
+            if state.global_step >= total:
+                self._profiler.stop()
+                self._profiler = None
+                print(f"[Profiler] stopped at step {state.global_step}. Open TensorBoard: tensorboard --logdir {self.output_dir}/profiler")
+                control.should_training_stop = True
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._profiler is not None:
+            self._profiler.stop()
+            self._profiler = None

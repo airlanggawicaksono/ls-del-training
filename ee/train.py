@@ -20,7 +20,7 @@ from trainer_utils import (
     _trainer_tokenizer_kwargs,
 )
 
-from .callbacks import TrainingMetricsCallback
+from .callbacks import TrainingMetricsCallback, TorchProfilerCallback
 from .hub import push_exit_heads_to_hub, push_training_logs_to_hub, save_exit_heads
 from .model_wrapper import EarlyExitLlamaWrapper
 from .trainer import EarlyExitTrainer
@@ -172,7 +172,14 @@ def run_ee_training(
         "data_collator": DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
     }
     metrics_cb = TrainingMetricsCallback(seq_length=cfg.max_seq_length)
-    trainer_kwargs["callbacks"] = [metrics_cb]
+    callbacks = [metrics_cb]
+    if getattr(cfg, "profile_steps", 0) > 0:
+        callbacks.append(TorchProfilerCallback(
+            output_dir=cfg.output_dir,
+            warmup_steps=2,
+            active_steps=cfg.profile_steps,
+        ))
+    trainer_kwargs["callbacks"] = callbacks
     trainer_kwargs.update(_trainer_tokenizer_kwargs(tokenizer))
     trainer = EarlyExitTrainer(**trainer_kwargs)
 

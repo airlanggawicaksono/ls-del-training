@@ -35,6 +35,10 @@ class EETrainConfig(TrainConfig):
     # Override: no gradient checkpointing (backbone frozen, no benefit)
     gradient_checkpointing: bool = False
 
+    # Steps to profile with torch.profiler (0 = disabled). Set to ~10 for a
+    # cheap profiling run to measure base_forward vs exit_forward vs backward.
+    profile_steps: int = 0
+
     @model_validator(mode="after")
     def validate_exit_config(self) -> "EETrainConfig":
         if len(self.exit_loss_weights) != len(self.exit_layer_indices):
