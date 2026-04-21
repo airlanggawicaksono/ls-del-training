@@ -16,7 +16,7 @@ from rouge_score import rouge_scorer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .hub import load_exit_heads
-from .inference import BaselineGenerator, EarlyExitGenerator, MultiExitGenerator
+from .inference import BaselineGenerator, EarlyExitGenerator
 from .model_wrapper import EarlyExitLlamaWrapper
 from .utils import freeze_base_model
 
@@ -244,112 +244,47 @@ def benchmark_latency_energy(
     return stats, generations
 
 
-def benchmark_multi_exit(
-    generator: MultiExitGenerator,
+def benchmark_per_exit(
+    base_model,
+    exit_heads: Dict[int, torch.nn.Module],
+    tokenizer,
     samples: List[Dict[str, str]],
+    exit_layer_indices: List[int],
     max_new_tokens: int = 128,
     warmup: int = 3,
-) -> Dict[str, Dict]:
+) -> Tuple[Dict[str, Dict], List[Dict]]:
     """
-    One forward pass per token — collects latency, energy, and ROUGE for every
-    exit layer simultaneously. Replaces separate per-exit forced runs.
+    Separate truncated run per exit layer using force_exit_layer.
 
-    Returns {
-        "exit_8":  {ttft_sec_mean, per_token_latency_sec_mean, total_energy_j,
-                    tokens_per_joule, rouge2_f1, rougeL_f1},
-        "exit_16": {...},
-        "base":    {...},
-    }
+    Each exit layer gets its own EarlyExitGenerator that stops decode at that
+    layer — KV cache entries are only built up to the forced exit layer during
+    decode, giving a real isolated hardware profile (power, VRAM, clocks) per exit.
+    Prefill still runs all 32 layers once to populate the KV cache.
+
+    Returns ({exit_8: stats, exit_16: stats, ...}, flat per-sample generations list)
     """
-    prompts = [s["prompt"] for s in samples]
-    references = [s["reference"] for s in samples]
+    all_stats: Dict[str, Dict] = {}
+    all_generations: List[Dict] = []
 
-    for i in range(min(warmup, len(prompts))):
-        generator.generate(prompts[i], max_new_tokens=32)
+    for idx in sorted(exit_layer_indices):
+        key = f"exit_{idx}"
+        print(f"\n  --- Per-exit benchmark: {key} (force_exit_layer={idx}) ---")
+        gen = EarlyExitGenerator(
+            base_model,
+            exit_heads,
+            tokenizer,
+            confidence_threshold=1.1,
+            use_kv_cache=True,
+            force_exit_layer=idx,
+        )
+        stats, gens = benchmark_latency_energy(gen, samples, max_new_tokens, warmup)
+        all_stats[key] = stats
+        for g in gens:
+            g["forced_exit_layer"] = idx
+            g["exit_key"] = key
+        all_generations.extend(gens)
 
-    # Accumulators per exit key
-    ttfts: Dict[str, List[float]] = {}
-    per_tok_lats: Dict[str, List[float]] = {}
-    e2e_lats: Dict[str, List[float]] = {}
-    energies: Dict[str, float] = {}
-    n_toks: Dict[str, int] = {}
-    gpu_utils: Dict[str, List[float]] = {}
-    gpu_mem_utils: Dict[str, List[float]] = {}
-    vram_gbs: Dict[str, List[float]] = {}
-    power_ws: Dict[str, List[float]] = {}
-    cpu_pcts: Dict[str, List[float]] = {}
-    ram_gbs: Dict[str, List[float]] = {}
-    predictions: Dict[str, List[str]] = {}
-    generations: List[Dict] = []
-
-    for i, prompt in enumerate(prompts):
-        result = generator.generate(prompt, max_new_tokens=max_new_tokens)
-        row: Dict = {"prompt": prompt, "reference": references[i]}
-        for key, out in result["exits"].items():
-            ttfts.setdefault(key, []).append(out["ttft_sec"])
-            per_tok_lats.setdefault(key, []).append(out["per_token_latency_sec"])
-            e2e_lats.setdefault(key, []).append(out["end_to_end_sec"])
-            energies[key] = energies.get(key, 0.0) + out["total_energy_j"]
-            n_toks[key] = n_toks.get(key, 0) + result["n_tokens"]
-            if out.get("avg_gpu_util_pct", 0) > 0:
-                gpu_utils.setdefault(key, []).append(out["avg_gpu_util_pct"])
-            if out.get("avg_gpu_mem_util_pct", 0) > 0:
-                gpu_mem_utils.setdefault(key, []).append(out["avg_gpu_mem_util_pct"])
-            if out.get("avg_vram_gb", 0) > 0:
-                vram_gbs.setdefault(key, []).append(out["avg_vram_gb"])
-            if out.get("avg_power_w", 0) > 0:
-                power_ws.setdefault(key, []).append(out["avg_power_w"])
-            if out.get("avg_cpu_pct", 0) > 0:
-                cpu_pcts.setdefault(key, []).append(out["avg_cpu_pct"])
-            if out.get("avg_ram_gb", 0) > 0:
-                ram_gbs.setdefault(key, []).append(out["avg_ram_gb"])
-            predictions.setdefault(key, []).append(out["text"])
-            row[key] = {
-                "text": out["text"],
-                "tokens": out.get("tokens", []),
-                "n_tokens": result["n_tokens"],
-                "ttft_sec": out["ttft_sec"],
-                "per_token_latency_sec": out["per_token_latency_sec"],
-                "end_to_end_sec": out["end_to_end_sec"],
-                "total_energy_j": out["total_energy_j"],
-                "joules_per_token": out.get("joules_per_token", 0.0),
-                "tokens_per_joule": out.get("tokens_per_joule", 0.0),
-                "avg_gpu_util_pct": out.get("avg_gpu_util_pct", 0.0),
-                "avg_gpu_mem_util_pct": out.get("avg_gpu_mem_util_pct", 0.0),
-                "avg_power_w": out.get("avg_power_w", 0.0),
-                "avg_cpu_pct": out.get("avg_cpu_pct", 0.0),
-                "avg_gpu_sm_clock_mhz": out.get("avg_gpu_sm_clock_mhz", 0.0),
-                "avg_gpu_mem_clock_mhz": out.get("avg_gpu_mem_clock_mhz", 0.0),
-            }
-        row["sample_idx"] = i
-        row["reference"] = references[i]
-        generations.append(row)
-        if (i + 1) % 10 == 0:
-            print(f"    [{i+1}/{len(prompts)}] multi-exit benchmark")
-
-    def _mean(lst): return round(sum(lst) / len(lst), 2) if lst else 0.0
-
-    stats: Dict[str, Dict] = {}
-    for key in ttfts:
-        rouge = compute_rouge(predictions[key], references)
-        ej = energies[key]
-        tok = n_toks[key]
-        stats[key] = {
-            "ttft_sec_mean": round(sum(ttfts[key]) / len(ttfts[key]), 6),
-            "per_token_latency_sec_mean": round(sum(per_tok_lats[key]) / len(per_tok_lats[key]), 6),
-            "end_to_end_sec_mean": round(sum(e2e_lats[key]) / len(e2e_lats[key]), 6),
-            "total_energy_j": round(ej, 4),
-            "tokens_per_joule": round(tok / ej if ej > 0 else 0.0, 2),
-            "joules_per_token": round(ej / tok if tok > 0 else 0.0, 6),
-            "avg_gpu_util_pct": _mean(gpu_utils.get(key, [])),
-            "avg_gpu_mem_util_pct": _mean(gpu_mem_utils.get(key, [])),
-            "avg_vram_gb": _mean(vram_gbs.get(key, [])),
-            "avg_power_w": _mean(power_ws.get(key, [])),
-            "avg_cpu_pct": _mean(cpu_pcts.get(key, [])),
-            "avg_ram_gb": _mean(ram_gbs.get(key, [])),
-            **rouge,
-        }
-    return stats, generations
+    return all_stats, all_generations
 
 
 def _compile_exit_heads(exit_heads: Dict[int, torch.nn.Module]) -> Dict[int, torch.nn.Module]:
@@ -479,10 +414,13 @@ def run_full_benchmark(
     compiled_exit_heads = _compile_exit_heads(exit_heads)
     print(f"  Compiled {len(base_model.model.layers)} MLP layers + {len(compiled_exit_heads)} exit heads")
 
-    # ---- Multi-exit: latency + energy + ROUGE + generations (one pipeline) ----
-    print("\n=== Multi-Exit Benchmark (one pass, shared KV cache) ===")
-    multi_gen = MultiExitGenerator(base_model, compiled_exit_heads, tokenizer)
-    results["per_exit"], results["per_exit_generations"] = benchmark_multi_exit(multi_gen, samples, max_new_tokens)
+    # ---- Per-exit: separate truncated run per exit layer.
+    # Each exit layer runs its own EarlyExitGenerator(force_exit_layer=idx).
+    # Decode stops at the forced layer — real isolated hardware profile per exit.
+    print("\n=== Per-Exit Benchmark (separate truncated run per exit layer) ===")
+    results["per_exit"], results["per_exit_generations"] = benchmark_per_exit(
+        base_model, compiled_exit_heads, tokenizer, samples, exit_layer_indices, max_new_tokens
+    )
     print("\n  Exit       | TTFT(s) | Per-tok(s) | E2E(s)  | Energy(J) | Tok/J  | R2-F1  | RL-F1")
     print("  -----------+---------+------------+---------+-----------+--------+--------+------")
     for key, r in results["per_exit"].items():
@@ -495,8 +433,11 @@ def run_full_benchmark(
             f"{r['rouge2_f1']:.4f} | {r['rougeL_f1']:.4f}"
         )
 
-    # ---- Latency + Energy + ROUGE: dynamic confidence exit ----
-    print(f"\n=== Latency/Energy/ROUGE: Dynamic EE (threshold={confidence_threshold}) ===")
+    # ---- Dynamic early exit: per-token confidence check at each exit layer.
+    # Prefill runs full 32-layer forward; decode uses KV cache.
+    # Each decode step exits at the first layer where max softmax prob >= confidence_threshold.
+    # Tokens that never reach threshold fall through to L31 (base model output).
+    print(f"\n=== Dynamic Early Exit (confidence threshold={confidence_threshold}, KV cache) ===")
     ee_gen = EarlyExitGenerator(
         base_model,
         compiled_exit_heads,
@@ -515,7 +456,10 @@ def run_full_benchmark(
     # ---- Comparison summary ----
     bl = results["baseline_latency"]
     print("\n" + "=" * 72)
-    print("COMPARISON SUMMARY (per exit layer vs baseline)")
+    print("COMPARISON SUMMARY")
+    print("  per_exit_*  : fixed exit layer, shared KV, all 32 layers always run")
+    print("  dynamic_ee  : confidence-based exit (thr={:.2f}), KV cache, exits early".format(confidence_threshold))
+    print("  baseline    : standard model.generate(), no exit heads")
     print("=" * 72)
 
     col_keys = [
