@@ -154,8 +154,10 @@ def benchmark_latency_energy(
     total_tokens = 0
     gpu_utils = []
     gpu_mem_utils = []
+    vram_gbs = []
     power_ws = []
     cpu_pcts = []
+    ram_gbs = []
     per_sample_exit_layers = []
     predictions = []
     generations = []
@@ -171,10 +173,14 @@ def benchmark_latency_energy(
             gpu_utils.append(result["avg_gpu_util_pct"])
         if result.get("avg_gpu_mem_util_pct", 0) > 0:
             gpu_mem_utils.append(result["avg_gpu_mem_util_pct"])
+        if result.get("avg_vram_gb", 0) > 0:
+            vram_gbs.append(result["avg_vram_gb"])
         if result.get("avg_power_w", 0) > 0:
             power_ws.append(result["avg_power_w"])
         if result.get("avg_cpu_pct", 0) > 0:
             cpu_pcts.append(result["avg_cpu_pct"])
+        if result.get("avg_ram_gb", 0) > 0:
+            ram_gbs.append(result["avg_ram_gb"])
         if "exit_layers" in result:
             per_sample_exit_layers.append(result["exit_layers"])
         predictions.append(result["text"])
@@ -228,8 +234,10 @@ def benchmark_latency_energy(
         "joules_per_token": round(joules_per_token, 6),
         "avg_gpu_util_pct": _mean(gpu_utils),
         "avg_gpu_mem_util_pct": _mean(gpu_mem_utils),
+        "avg_vram_gb": _mean(vram_gbs),
         "avg_power_w": _mean(power_ws),
         "avg_cpu_pct": _mean(cpu_pcts),
+        "avg_ram_gb": _mean(ram_gbs),
         "exit_layer_distribution": exit_layer_dist,
         **rouge,
     }
@@ -267,8 +275,10 @@ def benchmark_multi_exit(
     n_toks: Dict[str, int] = {}
     gpu_utils: Dict[str, List[float]] = {}
     gpu_mem_utils: Dict[str, List[float]] = {}
+    vram_gbs: Dict[str, List[float]] = {}
     power_ws: Dict[str, List[float]] = {}
     cpu_pcts: Dict[str, List[float]] = {}
+    ram_gbs: Dict[str, List[float]] = {}
     predictions: Dict[str, List[str]] = {}
     generations: List[Dict] = []
 
@@ -285,10 +295,14 @@ def benchmark_multi_exit(
                 gpu_utils.setdefault(key, []).append(out["avg_gpu_util_pct"])
             if out.get("avg_gpu_mem_util_pct", 0) > 0:
                 gpu_mem_utils.setdefault(key, []).append(out["avg_gpu_mem_util_pct"])
+            if out.get("avg_vram_gb", 0) > 0:
+                vram_gbs.setdefault(key, []).append(out["avg_vram_gb"])
             if out.get("avg_power_w", 0) > 0:
                 power_ws.setdefault(key, []).append(out["avg_power_w"])
             if out.get("avg_cpu_pct", 0) > 0:
                 cpu_pcts.setdefault(key, []).append(out["avg_cpu_pct"])
+            if out.get("avg_ram_gb", 0) > 0:
+                ram_gbs.setdefault(key, []).append(out["avg_ram_gb"])
             predictions.setdefault(key, []).append(out["text"])
             row[key] = {
                 "text": out["text"],
@@ -329,8 +343,10 @@ def benchmark_multi_exit(
             "joules_per_token": round(ej / tok if tok > 0 else 0.0, 6),
             "avg_gpu_util_pct": _mean(gpu_utils.get(key, [])),
             "avg_gpu_mem_util_pct": _mean(gpu_mem_utils.get(key, [])),
+            "avg_vram_gb": _mean(vram_gbs.get(key, [])),
             "avg_power_w": _mean(power_ws.get(key, [])),
             "avg_cpu_pct": _mean(cpu_pcts.get(key, [])),
+            "avg_ram_gb": _mean(ram_gbs.get(key, [])),
             **rouge,
         }
     return stats, generations
@@ -507,23 +523,29 @@ def run_full_benchmark(
         ("per_token_latency_sec_mean","Per-tok lat (s)",   False),
         ("end_to_end_sec_mean",       "E2E (s)",           False),
         ("tokens_per_joule",          "Tok/J",             True),
+        ("joules_per_token",          "J/tok",             False),
+        ("avg_power_w",               "Power (W)",         False),
+        ("avg_vram_gb",               "VRAM (GB)",         False),
+        ("avg_ram_gb",                "RAM (GB)",          False),
+        ("avg_gpu_util_pct",          "GPU util%",         True),
+        ("avg_gpu_sm_clock_mhz",      "SM clk(MHz)",       True),
         ("rouge2_f1",                 "R-2 F1",            True),
         ("rougeL_f1",                 "R-L F1",            True),
     ]
 
-    header = f"  {'Layer':<10s}" + "".join(f" {lbl:>14s}" for _, lbl, _ in col_keys)
+    header = f"  {'Layer':<12s}" + "".join(f" {lbl:>13s}" for _, lbl, _ in col_keys)
     print(header)
-    print("  " + "-" * (10 + 14 * len(col_keys)))
+    print("  " + "-" * (12 + 13 * len(col_keys)))
 
     def _row(label, row):
-        parts = [f"  {label:<10s}"]
+        parts = [f"  {label:<12s}"]
         for key, _, higher in col_keys:
-            bv = bl[key]
-            rv = row[key]
+            bv = bl.get(key, 0)
+            rv = row.get(key, 0)
             ratio = ""
             if bv > 0:
                 ratio = f"{rv/bv:.2f}x" if higher else f"{bv/rv:.2f}x"
-            parts.append(f" {rv:>8.4f}{ratio:>6s}")
+            parts.append(f" {rv:>7.3f}{ratio:>6s}")
         print("".join(parts))
 
     _row("baseline", bl)

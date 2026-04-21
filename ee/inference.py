@@ -37,6 +37,7 @@ def _sample_hw() -> Dict[str, float]:
     if torch.cuda.is_available():
         out["vram_allocated_gb"] = round(torch.cuda.memory_allocated() / (1024**3), 3)
     out["cpu_pct"] = _psutil_process.cpu_percent()
+    out["ram_used_gb"] = round(_psutil_process.memory_info().rss / (1024**3), 3)
     return out
 
 
@@ -364,8 +365,10 @@ class EarlyExitGenerator:
             "joules_per_token": round(total_energy_j / n_tokens if n_tokens > 0 else 0.0, 6),
             "avg_gpu_util_pct": _mean("gpu_util_pct"),
             "avg_gpu_mem_util_pct": _mean("gpu_mem_util_pct"),
+            "avg_vram_gb": _mean("vram_allocated_gb"),
             "avg_power_w": _mean("power_w"),
             "avg_cpu_pct": _mean("cpu_pct"),
+            "avg_ram_gb": _mean("ram_used_gb"),
             "avg_gpu_sm_clock_mhz": _mean("gpu_sm_clock_mhz"),
             "avg_gpu_mem_clock_mhz": _mean("gpu_mem_clock_mhz"),
         }
@@ -576,8 +579,10 @@ class MultiExitGenerator:
                 "joules_per_token": round(energy_j / len(times) if len(times) > 0 else 0.0, 6),
                 "avg_gpu_util_pct": _mean("gpu_util_pct"),
                 "avg_gpu_mem_util_pct": _mean("gpu_mem_util_pct"),
+                "avg_vram_gb": _mean("vram_allocated_gb"),
                 "avg_power_w": _mean("power_w"),
                 "avg_cpu_pct": _mean("cpu_pct"),
+                "avg_ram_gb": _mean("ram_used_gb"),
                 "avg_gpu_sm_clock_mhz": _mean("gpu_sm_clock_mhz"),
                 "avg_gpu_mem_clock_mhz": _mean("gpu_mem_clock_mhz"),
             }
@@ -679,8 +684,10 @@ class BaselineGenerator:
             "joules_per_token": round(total_energy_j / n_tokens if n_tokens > 0 else 0.0, 6),
             "avg_gpu_util_pct": round(avg_hw.get("gpu_util_pct", 0.0), 2),
             "avg_gpu_mem_util_pct": round(avg_hw.get("gpu_mem_util_pct", 0.0), 2),
+            "avg_vram_gb": round(avg_hw.get("vram_allocated_gb", 0.0), 3),
             "avg_power_w": round(avg_power, 2),
             "avg_cpu_pct": round(avg_hw.get("cpu_pct", 0.0), 2),
+            "avg_ram_gb": round(avg_hw.get("ram_used_gb", 0.0), 3),
             "avg_gpu_sm_clock_mhz": round(avg_hw.get("gpu_sm_clock_mhz", 0.0), 1),
             "avg_gpu_mem_clock_mhz": round(avg_hw.get("gpu_mem_clock_mhz", 0.0), 1),
         }
