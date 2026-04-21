@@ -214,6 +214,7 @@ def benchmark_multi_exit(
     # Accumulators per exit key
     ttfts: Dict[str, List[float]] = {}
     per_tok_lats: Dict[str, List[float]] = {}
+    e2e_lats: Dict[str, List[float]] = {}
     energies: Dict[str, float] = {}
     n_toks: Dict[str, int] = {}
     predictions: Dict[str, List[str]] = {}
@@ -225,6 +226,7 @@ def benchmark_multi_exit(
         for key, out in result["exits"].items():
             ttfts.setdefault(key, []).append(out["ttft_sec"])
             per_tok_lats.setdefault(key, []).append(out["per_token_latency_sec"])
+            e2e_lats.setdefault(key, []).append(out["end_to_end_sec"])
             energies[key] = energies.get(key, 0.0) + out["total_energy_j"]
             n_toks[key] = n_toks.get(key, 0) + result["n_tokens"]
             predictions.setdefault(key, []).append(out["text"])
@@ -241,6 +243,7 @@ def benchmark_multi_exit(
         stats[key] = {
             "ttft_sec_mean": round(sum(ttfts[key]) / len(ttfts[key]), 6),
             "per_token_latency_sec_mean": round(sum(per_tok_lats[key]) / len(per_tok_lats[key]), 6),
+            "end_to_end_sec_mean": round(sum(e2e_lats[key]) / len(e2e_lats[key]), 6),
             "total_energy_j": round(ej, 4),
             "tokens_per_joule": round(tok / ej if ej > 0 else 0.0, 2),
             **rouge,
@@ -378,12 +381,13 @@ def run_full_benchmark(
     print("\n=== Multi-Exit Benchmark (one pass, shared KV cache) ===")
     multi_gen = MultiExitGenerator(base_model, compiled_exit_heads, tokenizer)
     results["per_exit"], results["per_exit_generations"] = benchmark_multi_exit(multi_gen, samples, max_new_tokens)
-    print("\n  Exit       | TTFT(s) | Per-tok(s) | Energy(J) | Tok/J  | R2-F1  | RL-F1")
-    print("  -----------+---------+------------+-----------+--------+--------+------")
+    print("\n  Exit       | TTFT(s) | Per-tok(s) | E2E(s)  | Energy(J) | Tok/J  | R2-F1  | RL-F1")
+    print("  -----------+---------+------------+---------+-----------+--------+--------+------")
     for key, r in results["per_exit"].items():
         print(
             f"  {key:10s} | {r['ttft_sec_mean']:.4f}  | "
             f"{r['per_token_latency_sec_mean']:.6f} | "
+            f"{r['end_to_end_sec_mean']:.4f}  | "
             f"{r['total_energy_j']:9.2f} | "
             f"{r['tokens_per_joule']:6.2f} | "
             f"{r['rouge2_f1']:.4f} | {r['rougeL_f1']:.4f}"
