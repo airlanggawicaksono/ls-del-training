@@ -581,6 +581,10 @@ class BaselineGenerator:
         self._num_layers = len(raw.model.layers) - 1 if hasattr(raw, "model") else 31
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+        if hasattr(raw, "generation_config"):
+            raw.generation_config.temperature = None
+            raw.generation_config.top_p = None
 
     @torch.no_grad()
     def generate(
@@ -590,6 +594,7 @@ class BaselineGenerator:
     ) -> Dict:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
         input_ids = input_ids.to(self.model.device)
+        attention_mask = torch.ones_like(input_ids)
         prompt_len = input_ids.shape[1]
 
         torch.cuda.synchronize()
@@ -598,8 +603,10 @@ class BaselineGenerator:
 
         out = self.model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
         )
 
         torch.cuda.synchronize()
